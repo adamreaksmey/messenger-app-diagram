@@ -1,0 +1,1 @@
+- [ ] Replace redis pub/sub with stream ( i think ill stick with pub/sub for now )

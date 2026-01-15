@@ -1,0 +1,132 @@
+sequenceDiagram
+    %% Participants
+    participant CLIENT as Clients<br/>Web/Mobile/Desktop
+    participant LB
+    participant GATEWAY
+    participant WSGATE as WebSocket Gateway<br>lxzan/gws
+    participant MONGO
+    participant REDIS
+    participant RABBIT
+    participant POSTGRES
+    participant S3
+    participant GETSTREAM
+    participant ALIYUN
+    autonumber
+
+    box lightblue Infrastructure Layer
+    participant LB as Load Balancer<br/>Nginx
+    participant POSTGRES as PostgreSQL
+    participant MONGO as MongoDB
+    participant REDIS as Redis<br/>(Chat Delivery)
+    participant RABBIT as RabbitMQ<br/>(Background Jobs)
+    participant S3 as Aliyun OSS + CDN
+    end
+
+    box lightyellow Gateway Layer
+    participant GATEWAY as REST API Gateway<br/>Gin
+    participant WSGATE as WebSocket Gateway<br/>Gorilla WS
+    end
+
+    box lightgreen Backend Services Layer
+    participant AUTH as Auth & User Service
+    participant CHAT as Chat Service
+    participant MEDIA as Media Service
+    participant NOTIF as Notification Worker
+    participant EMAIL as Email Worker
+    end
+
+    box lightpink Third-Party Services
+    participant GETSTREAM as GetStream.io<br/>(Audio Calls)
+    participant ALIYUN as Aliyun Apsara<br/>(Video Calls)
+    end
+
+    %% Entry
+    CLIENT->>LB: HTTP / WebSocket Request
+    LB->>GATEWAY: REST / HTTP
+    LB->>WSGATE: WebSocket
+
+    %% REST path
+    GATEWAY->>AUTH: Auth / Profile APIs
+    GATEWAY->>CHAT: Chat / Group / Notification APIs
+    GATEWAY->>MEDIA: Media APIs
+
+    %% WebSocket path - REAL-TIME CHAT DELIVERY via Redis
+    WSGATE->>CHAT: New message received
+    CHAT->>MONGO: Persist message
+    CHAT->>REDIS: PUBLISH to channel (fanout to all connected clients)
+    REDIS-->>WSGATE: Message propagated to all WS instances
+    WSGATE-->>CLIENT: Real-time message delivery via WebSocket
+
+    %% ASYNC BACKGROUND TASKS via RabbitMQ
+    CHAT->>RABBIT: Queue: Push Notification Job
+    CHAT->>RABBIT: Queue: Email Notification Job
+    CHAT->>RABBIT: Queue: Mobile Background Delivery Job
+    CHAT->>RABBIT: Queue: Mention Detection Job
+
+    RABBIT->>NOTIF: Consume push notification job
+    NOTIF->>CLIENT: Send push notification via FCM / APNS
+
+    RABBIT->>EMAIL: Consume email notification job
+    EMAIL->>CLIENT: Send email notification
+
+    RABBIT->>NOTIF: Consume mobile background delivery job
+    NOTIF->>CLIENT: Background sync for offline mobile clients
+
+    RABBIT->>CHAT: Consume mention detection job
+    CHAT->>POSTGRES: Store mention metadata
+    CHAT->>REDIS: Cache mention notifications
+
+    %% Data layer
+    AUTH->>POSTGRES: Read / Write user data
+    AUTH->>REDIS: Session & token cache
+
+    CHAT->>POSTGRES: User / Group metadata
+    CHAT->>REDIS: Presence tracking & online status
+
+    MEDIA->>S3: Store / retrieve media
+    MEDIA->>POSTGRES: Media metadata
+
+    %% Audio Call Operations via GetStream.io
+    GATEWAY->>CHAT: Audio call initiation
+    CHAT->>GETSTREAM: Create session & auth token
+    GETSTREAM-->>CHAT: Return credentials & TURN/STUN
+    CHAT->>REDIS: Cache call state
+    CHAT->>POSTGRES: Log call metadata
+    CHAT-->>CLIENT: Return credentials
+    CLIENT->>GETSTREAM: Establish P2P audio connection
+    GETSTREAM-->>CLIENT: Audio streaming
+    WSGATE->>CHAT: Call signaling events
+    CHAT->>REDIS: PUBLISH call status
+    REDIS-->>WSGATE: Broadcast status
+    WSGATE-->>CLIENT: Call notifications
+    CLIENT->>GETSTREAM: End call
+    GETSTREAM->>CHAT: Webhook with statistics
+    CHAT->>POSTGRES: Update call record
+    CHAT->>RABBIT: Queue: Call analytics
+
+    %% Video Call Operations via Aliyun Apsara
+    GATEWAY->>CHAT: Video call initiation
+    CHAT->>ALIYUN: Create video room
+    ALIYUN-->>CHAT: Return room credentials & SFU
+    CHAT->>REDIS: Cache video call state
+    CHAT->>POSTGRES: Log video metadata
+    CHAT-->>CLIENT: Return credentials
+    CLIENT->>ALIYUN: Join video room
+    ALIYUN-->>CLIENT: Video/audio streaming via SFU
+    WSGATE->>CHAT: Video call signaling
+    CHAT->>REDIS: PUBLISH video status
+    REDIS-->>WSGATE: Broadcast updates
+    WSGATE-->>CLIENT: Video notifications
+    CLIENT->>ALIYUN: Leave room
+    ALIYUN->>CHAT: Webhook with statistics
+    CHAT->>POSTGRES: Update video record
+    CHAT->>RABBIT: Queue: Video analytics
+
+    %% Notes
+    Note over CLIENT: Client Layer<br/>Web, Mobile, Desktop Apps
+    Note over LB,S3: Infrastructure Layer<br/>Load balancing, Databases, Caches, Queues, Storage
+    Note over GATEWAY,WSGATE: Gateway Layer<br/>Protocol routing & connection management
+    Note over AUTH,EMAIL: Backend Services Layer<br/>Business logic, Workers, Async processors
+    Note over GETSTREAM,ALIYUN: Third-Party Services<br/>GetStream.io for audio calls<br/>Aliyun Apsara for video calls
+    Note over REDIS: REDIS = Real-time Chat Delivery<br/>Pub/Sub for instant message fanout<br/>Presence & session cache<br/>Call state & signaling
+    Note over RABBIT,NOTIF: RABBITMQ = Background Jobs<br/>Push notifications, Email, Mobile sync<br/>Mention detection, Call analytics

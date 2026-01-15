@@ -1,0 +1,162 @@
+sequenceDiagram
+    autonumber
+    participant Clients as Clients<br/>Web/Mobile/Desktop
+    
+    box lightblue Infrastructure Layer
+    participant CDN as CloudFront CDN
+    participant WAF as WAF / DDoS Protection
+    participant LB as Load Balancer<br/>Nginx
+    participant PGMASTER as PostgreSQL Master
+    participant PGREPLICA as PostgreSQL Replica
+    participant MONGOMASTER as MongoDB Master
+    participant MONGOREPLICA as MongoDB Replica
+    participant REDIS as Redis Cluster<br/>(Real-time Pub/Sub)
+    participant RABBIT as RabbitMQ<br/>(Background Jobs)
+    participant S3 as Object Storage<br/>AWS S3 / Aliyun OSS
+    participant ELASTIC as Elasticsearch
+    end
+    
+    box lightyellow Gateway Layer
+    participant APIGW as REST API Gateway<br/>Gin
+    participant WSGW as WebSocket Gateway<br/>Gorilla WS
+    end
+    
+    box lightgreen Backend Services Layer
+    participant AUTH as Auth Service
+    participant USER as User Service
+    participant CHAT as Chat Service
+    participant GROUP as Group Service
+    participant MSG as Message Service
+    participant MEDIA as Media Service
+    participant NOTIFY as Notification Service
+    participant SEARCH as Search Service
+    participant ANALYTICS as Analytics Service
+    end
+    
+    box lightpink Third-Party Services
+    participant GETSTREAM as GetStream.io<br/>(Audio Calls)
+    participant ALIYUN as Aliyun Apsara<br/>(Video Calls)
+    end
+
+    %% Entry & Security
+    Clients->>CDN: HTTP / WebSocket Request
+    CDN->>WAF: Forward request with caching
+    WAF->>LB: Request passed security filters
+    
+    %% Gateway Routing
+    LB->>APIGW: Route HTTP/REST traffic
+    LB->>WSGW: Route WebSocket traffic
+    
+    %% Authentication Flow
+    APIGW->>AUTH: Verify JWT + 2FA
+    AUTH->>PGMASTER: Validate user credentials
+    AUTH->>REDIS: Check/store session token cache
+    
+    %% User Service Operations
+    APIGW->>USER: Profile/settings requests
+    USER->>PGREPLICA: Read user profile data
+    USER->>REDIS: Cache lookup for frequently accessed data
+    
+    %% Real-time Chat via WebSocket + Redis
+    WSGW->>CHAT: New real-time message received
+    CHAT->>MSG: Forward message for persistence
+    MSG->>MONGOMASTER: Write message to chat history
+    CHAT->>REDIS: PUBLISH message to channel (instant fanout)
+    REDIS-->>WSGW: Message propagated to all WS instances
+    WSGW-->>Clients: Real-time delivery via WebSocket
+    WSGW->>REDIS: Update user presence & online status
+    
+    %% REST Chat Operations
+    APIGW->>CHAT: Chat history/status requests
+    CHAT->>REDIS: Check user/chat presence cache
+    
+    %% Analytics (async via RabbitMQ)
+    MSG->>RABBIT: Queue: Analytics event job
+    RABBIT->>ANALYTICS: Consume analytics job
+    ANALYTICS->>PGMASTER: Store analytics data
+    
+    %% Background Jobs via RabbitMQ
+    MSG->>RABBIT: Queue: Push notification job
+    MSG->>RABBIT: Queue: Email notification job
+    MSG->>RABBIT: Queue: Offline delivery job
+    MSG->>RABBIT: Queue: Mention detection job
+    
+    RABBIT->>NOTIFY: Consume notification jobs
+    NOTIFY->>Clients: Send push via FCM/APNS
+    
+    %% Message History & Search
+    MSG->>MONGOREPLICA: Read message history
+    MSG->>ELASTIC: Update search index asynchronously
+    
+    %% Group Operations
+    APIGW->>GROUP: Group/channel management
+    GROUP->>PGMASTER: Write group metadata
+    GROUP->>REDIS: Sync group member cache
+    
+    %% Media Operations
+    APIGW->>MEDIA: Upload/download media
+    MEDIA->>S3: Store files (S3 or Aliyun OSS)
+    MEDIA->>RABBIT: Queue: Transcoding job
+    MEDIA->>RABBIT: Queue: Thumbnail generation job
+    
+    RABBIT->>MEDIA: Consume media processing jobs
+    MEDIA->>S3: Store processed media
+    MEDIA->>PGMASTER: Update media metadata
+    
+    %% Search Operations
+    APIGW->>SEARCH: Search messages/users
+    SEARCH->>ELASTIC: Query search index
+    SEARCH->>REDIS: Cache frequent search results
+    
+    %% Audio Call Operations via GetStream.io
+    APIGW->>CHAT: Audio call initiation request
+    CHAT->>GETSTREAM: Create call session & generate auth token
+    GETSTREAM-->>CHAT: Return session ID, credentials, TURN/STUN servers
+    CHAT->>REDIS: Cache active call state
+    CHAT->>PGMASTER: Log call metadata (call ID, participants, start time)
+    CHAT-->>Clients: Return GetStream credentials
+    Clients->>GETSTREAM: Establish P2P audio connection via SDK
+    GETSTREAM-->>Clients: Audio streaming (P2P or TURN relay)
+    WSGW->>CHAT: Forward call signaling (ringing, accept, reject, hold)
+    
+    %% Audio Call Signaling & Notifications
+    CHAT->>REDIS: PUBLISH call status changes
+    REDIS-->>WSGW: Broadcast call status to WS instances
+    WSGW-->>Clients: Deliver call notifications in real-time
+    
+    %% Audio Call Termination
+    Clients->>GETSTREAM: End call event
+    GETSTREAM->>CHAT: Webhook: Call ended with statistics
+    CHAT->>PGMASTER: Update call record (end time, duration, quality)
+    CHAT->>RABBIT: Queue: Call analytics job
+    
+    %% Video Call Operations via Aliyun Apsara
+    APIGW->>CHAT: Video call initiation request
+    CHAT->>ALIYUN: Create video room & generate access credentials
+    ALIYUN-->>CHAT: Return room ID, access token, SFU endpoint
+    CHAT->>REDIS: Cache active video call state
+    CHAT->>PGMASTER: Log video call metadata
+    CHAT-->>Clients: Return Aliyun video room credentials
+    Clients->>ALIYUN: Join video room with access token via SDK
+    ALIYUN-->>Clients: Video/audio streaming via SFU
+    WSGW->>CHAT: Forward video call signaling (camera, screen share, participant events)
+    
+    %% Video Call Signaling & Notifications
+    CHAT->>REDIS: PUBLISH video call status
+    REDIS-->>WSGW: Broadcast video call updates
+    WSGW-->>Clients: Deliver video call notifications
+    
+    %% Video Call Termination
+    Clients->>ALIYUN: Leave video room
+    ALIYUN->>CHAT: Webhook: Session ended with statistics
+    CHAT->>PGMASTER: Update video call record (end time, duration, participants, quality)
+    CHAT->>RABBIT: Queue: Video call analytics job
+    
+    %% Notes
+    Note over Clients: Client Layer<br/>Web, Mobile, Desktop Applications
+    Note over CDN,ELASTIC: Infrastructure Layer<br/>CDN, Security, Databases, Caches, Queues, Storage
+    Note over APIGW,WSGW: Gateway Layer<br/>Protocol routing, Auth enforcement, Rate limiting
+    Note over AUTH,ANALYTICS: Backend Services Layer<br/>Business logic microservices
+    Note over GETSTREAM,ALIYUN: Third-Party Services<br/>GetStream.io for audio calls<br/>Aliyun Apsara for video calls
+    Note over REDIS: REDIS = Real-time Message Delivery<br/>Pub/Sub for instant chat fanout<br/>Session cache & presence tracking<br/>Call state & signaling
+    Note over RABBIT: RABBITMQ = Background Jobs ONLY<br/>Push notifications, Email, Media processing<br/>Mention detection, Offline delivery, Analytics
