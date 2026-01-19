@@ -184,7 +184,6 @@ CREATE TABLE media_files (
     checksum VARCHAR(100),                -- "sha256:abc123..." for deduplication
     uploaded_at TIMESTAMP DEFAULT NOW(),
     expires_at TIMESTAMP,                 -- null = permanent, set for temp files
-    reference_count INT DEFAULT 0         -- How many messages use this file
 );
 
 CREATE INDEX idx_media_checksum ON media_files(checksum);
@@ -308,3 +307,46 @@ Result: 1 file in OSS instead of 3 (66% storage savings)
 | MESSAGE_DELIVERIES | MongoDB    | 1B+    | Track/retry push notifications |
 | MENTIONS           | PostgreSQL | 10M+   | "5 unread mentions" badge      |
 | MEDIA_FILES        | PostgreSQL | 50M+   | File metadata & deduplication  |
+
+### 4.1 Technical Part: How to map them into the messages:
+
+Below is a code sample that can be followed:
+
+```go
+// API: GET /api/conversations/{id}/messages
+
+func GetMessages(conversationID string, limit int) ([]Message, error) {
+    // 1. Fetch messages from MongoDB
+    messages := fetchFromMongoDB(conversationID, limit)
+    // Returns: [
+    //   { message_id: "msg1", content: "Check this!", media_ids: ["media-123", "media-456"] },
+    //   { message_id: "msg2", content: "Hi", media_ids: [] }
+    // ]
+
+    // 2. Collect all media_ids from all messages
+    var allMediaIDs []string
+    for _, msg := range messages {
+        allMediaIDs = append(allMediaIDs, msg.MediaIDs...)
+    }
+    // allMediaIDs = ["media-123", "media-456"]
+
+    // 3. Batch fetch media metadata from PostgreSQL (single query!)
+    mediaMap := fetchMediaMetadata(allMediaIDs)
+    // Returns: {
+    //   "media-123": { cdn_url: "https://cdn.../photo.jpg", mime_type: "image/jpeg", ... },
+    //   "media-456": { cdn_url: "https://cdn.../video.mp4", mime_type: "video/mp4", ... }
+    // }
+
+    // 4. Enrich messages with media metadata
+    for i := range messages {
+        messages[i].Media = []MediaFile{}
+        for _, mediaID := range messages[i].MediaIDs {
+            if media, ok := mediaMap[mediaID]; ok {
+                messages[i].Media = append(messages[i].Media, media)
+            }
+        }
+    }
+
+    return messages, nil
+}
+```
