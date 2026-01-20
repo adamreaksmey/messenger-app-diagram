@@ -386,3 +386,111 @@ Sample response to client:
   ]
 }
 ```
+
+### 4.1 Forwarding Flow
+
+**Scenario: Alice forwards Bob's photo to Charlie**
+
+```json
+Original message (Bob → Alice):
+{
+  message_id: "msg-123",
+  sender_id: "bob",
+  content: "Check out my cat!",
+  media_ids: ["media-456"]
+}
+
+Alice clicks "Forward" → Selects Charlie's chat
+```
+
+**What Happens**
+**Client-side (Alice's app):**
+
+```json
+// Alice already has the full message object in memory
+const originalMessage = {
+  message_id: "msg-123",
+  content: "Check out my cat!",
+  media: [
+    {
+      media_id: "media-456",
+      cdn_url: "https://cdn.../cat.jpg",
+      mime_type: "image/jpeg",
+      // ... all metadata already fetched from Pattern 1
+    }
+  ]
+}
+
+// Forward action
+POST /api/messages/forward
+{
+  original_message_id: "msg-123",  // Optional: track forward chain
+  target_conversation_id: "alice-charlie-conv",
+  content: "Check out my cat!",  // Can modify
+  media_ids: ["media-456"]  // ← Just reuse the same media_id!
+}
+```
+
+**Server side:**
+
+```go
+func ForwardMessage(req ForwardRequest) error {
+    // 1. Validate user has access to original message
+    originalMsg := mongodb.FindMessage(req.OriginalMessageID)
+    if !userCanAccessConversation(currentUser, originalMsg.ConversationID) {
+        return errors.New("unauthorized")
+    }
+
+    // 2. Validate user can send to target conversation
+    if !userCanSendTo(currentUser, req.TargetConversationID) {
+        return errors.New("unauthorized")
+    }
+
+    // 3. Validate media_ids exist and user has access
+    for _, mediaID := range req.MediaIDs {
+        media := postgres.Query(`
+            SELECT uploaded_by FROM media_files WHERE media_id = $1
+        `, mediaID)
+
+        // Check if user can access this media
+        // (either uploader or member of conversation where it was shared)
+        if !userCanAccessMedia(currentUser, media) {
+            return errors.New("cannot forward this media")
+        }
+    }
+
+    // 4. Create new message in MongoDB
+    newMessage := Message{
+        MessageID:      uuid.New(),
+        ConversationID: req.TargetConversationID,
+        SenderID:       currentUser.ID,
+        Content:        req.Content,
+        MediaIDs:       req.MediaIDs,  // ← Same media_ids, no duplication!
+        Metadata: {
+            "forwarded_from": req.OriginalMessageID,  // Track forward chain
+        },
+        CreatedAt:      time.Now(),
+    }
+    mongodb.Insert(newMessage)
+
+    // 5. Increment reference count (important!)
+    postgres.Exec(`
+        UPDATE media_files
+        SET reference_count = reference_count + 1
+        WHERE media_id = ANY($1)
+    `, req.MediaIDs)
+
+    // 6. Real-time delivery (Redis pub/sub, etc.)
+    publishToConversation(req.TargetConversationID, newMessage)
+
+    return nil
+}
+```
+
+#### Key points
+
+```
+Original message:  media_ids: ["media-456"]
+Forwarded message: media_ids: ["media-456"]  ← Same ID!
+No new file uploaded! Same file, same CDN URL, just referenced by 2 messages now.
+```
