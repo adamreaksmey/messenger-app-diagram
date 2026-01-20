@@ -350,3 +350,39 @@ func GetMessages(conversationID string, limit int) ([]Message, error) {
     return messages, nil
 }
 ```
+
+Sample response to client:
+
+```json
+{
+  "messages": [
+    {
+      "message_id": "msg1",
+      "content": "Check this!",
+      "media": [
+        {
+          "media_id": "media-123",
+          "cdn_url": "https://cdn.example.com/photo.jpg",
+          "mime_type": "image/jpeg",
+          "file_size": 204800,
+          "metadata": { "width": 1920, "height": 1080, "thumbnail": "..." }
+        },
+        {
+          "media_id": "media-456",
+          "cdn_url": "https://cdn.example.com/video.mp4",
+          "mime_type": "video/mp4",
+          "file_size": 5242880,
+          "metadata": { "duration": 15, "thumbnail": "..." }
+        }
+      ],
+      "created_at": "2026-01-15T10:30:00Z"
+    },
+    {
+      "message_id": "msg2",
+      "content": "Hi",
+      "media": [],
+      "created_at": "2026-01-15T10:31:00Z"
+    }
+  ]
+}
+```
