@@ -4,9 +4,9 @@
 
 ```mermaid
 sequenceDiagram
-    participant Client as AuthClient
-    participant Server as Auth Server
-    participant Storage as Secure Storage
+    participant Client as Frontend
+    participant Server as User Service
+    participant Storage as Postgres
 
     Note over Client,Server: Phase 1: Device Registration (HTTPS)
 
@@ -108,9 +108,9 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Client as AuthClient
+    participant Client as Frontend
     participant Crypto as Crypto Module
-    participant Storage as Secure Storage
+    participant Storage as Postgres
 
     Note over Client: Token Generation Process
 
@@ -157,9 +157,9 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Client as AuthClient
+    participant Client as Frontend
     participant Crypto as Crypto Module
-    participant Storage as Secure Storage
+    participant Storage as Postgres
 
     Note over Client: Authenticated Request Signature Generation
 
