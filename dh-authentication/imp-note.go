@@ -172,6 +172,33 @@ func ComputeDHSharedSecret(privateKey, peerPublicKey *big.Int) *big.Int {
 	return new(big.Int).Exp(peerPublicKey, privateKey, dhParams.Prime)
 }
 
+// ValidateDHPublicKey validates a DH public key to prevent small subgroup attacks
+// FIX #2: Added DH public key validation
+func ValidateDHPublicKey(publicKey *big.Int) error {
+	// Check if public key is in valid range: 1 < publicKey < p-1
+	one := big.NewInt(1)
+	pMinusOne := new(big.Int).Sub(dhParams.Prime, one)
+
+	if publicKey.Cmp(one) <= 0 {
+		return fmt.Errorf("public key must be greater than 1")
+	}
+
+	if publicKey.Cmp(pMinusOne) >= 0 {
+		return fmt.Errorf("public key must be less than p-1")
+	}
+
+	// Additional check: verify publicKey^q mod p = 1 (where q = (p-1)/2)
+	// This ensures the key is in the correct subgroup
+	q := new(big.Int).Div(pMinusOne, big.NewInt(2))
+	result := new(big.Int).Exp(publicKey, q, dhParams.Prime)
+
+	if result.Cmp(one) != 0 {
+		return fmt.Errorf("public key not in correct subgroup")
+	}
+
+	return nil
+}
+
 // DeriveDeviceSecret derives device secret using HKDF-SHA256
 func DeriveDeviceSecret(sharedSecret []byte, info string) ([]byte, error) {
 	salt := []byte("device-auth-v1")
@@ -243,6 +270,14 @@ func registerDeviceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	clientPublicKey := new(big.Int).SetBytes(clientPublicKeyBytes)
 
+	// FIX #2: Validate client's public key before using it
+	if err := ValidateDHPublicKey(clientPublicKey); err != nil {
+		log.Printf("❌ Invalid client public key: %v", err)
+		http.Error(w, "Invalid public key", http.StatusBadRequest)
+		return
+	}
+	log.Println("✓ Client public key validated")
+
 	// Generate server DH keypair
 	serverPrivateKey, serverPublicKey, err := GenerateDHKeyPair()
 	if err != nil {
@@ -309,12 +344,13 @@ func generateDeviceID() string {
 // ============================================================================
 
 type LoginRequest struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	DeviceID  string `json:"device_id"`
-	SessionID string `json:"session_id"`
-	Timestamp string `json:"timestamp"`
-	Nonce     string `json:"nonce"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	DeviceID        string `json:"device_id"`
+	SessionID       string `json:"session_id"`
+	Timestamp       string `json:"timestamp"`
+	Nonce           string `json:"nonce"`
+	DeviceSignature string `json:"device_signature"` // FIX #5: Proof of device ownership
 }
 
 type LoginResponse struct {
@@ -331,9 +367,24 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("🔑 Login attempt: %s", req.Username)
 
+	// FIX #3: Validate timestamp first (prevent replay attacks)
+	ts, err := strconv.ParseInt(req.Timestamp, 10, 64)
+	if err != nil || !isTimestampValid(ts) {
+		log.Printf("❌ Invalid or expired timestamp")
+		http.Error(w, "Invalid or expired timestamp", http.StatusUnauthorized)
+		return
+	}
+
+	// FIX #3: Check nonce not reused (prevent replay attacks)
+	if isNonceUsed(req.Nonce) {
+		log.Printf("❌ Nonce already used (replay attack detected)")
+		http.Error(w, "Nonce already used", http.StatusUnauthorized)
+		return
+	}
+
 	// Validate credentials
 	var user User
-	err := db.QueryRow(
+	err = db.QueryRow(
 		"SELECT id, username, password_hash FROM users WHERE username = $1",
 		req.Username,
 	).Scan(&user.ID, &user.Username, &user.PasswordHash)
@@ -352,26 +403,62 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify device exists and belongs to user (or is unassigned)
+	// Verify device exists
 	var device Device
 	err = db.QueryRow(
-		"SELECT device_id, device_secret_hash FROM devices WHERE device_id = $1",
+		"SELECT device_id, device_secret_hash, user_id FROM devices WHERE device_id = $1",
 		req.DeviceID,
-	).Scan(&device.ID, &device.DeviceSecretHash)
+	).Scan(&device.ID, &device.DeviceSecretHash, &device.UserID)
 
 	if err != nil {
 		http.Error(w, "Invalid device", http.StatusUnauthorized)
 		return
 	}
 
-	// Link device to user if not already linked
-	_, err = db.Exec(
-		"UPDATE devices SET user_id = $1 WHERE device_id = $2 AND user_id IS NULL",
-		user.ID, req.DeviceID,
-	)
+	// Get device secret for verification
+	deviceSecret, err := getDeviceSecretForVerification(device.DeviceSecretHash)
+	if err != nil {
+		log.Printf("❌ Failed to retrieve device secret: %v", err)
+		http.Error(w, "Device verification failed", http.StatusInternalServerError)
+		return
+	}
 
-	// Verify session ID format (should be HMAC of device_id:timestamp:nonce)
-	// For simplicity, we'll accept it and store it
+	// FIX #3: Verify session ID is correctly constructed
+	expectedSessionData := fmt.Sprintf("%s:%s:%s", req.DeviceID, req.Timestamp, req.Nonce)
+	expectedSessionID := GenerateHMAC(deviceSecret, expectedSessionData)
+
+	if !subtle.ConstantTimeCompare([]byte(req.SessionID), []byte(expectedSessionID)) {
+		log.Printf("❌ Invalid session ID (expected: %s, got: %s)", expectedSessionID, req.SessionID)
+		http.Error(w, "Invalid session ID", http.StatusUnauthorized)
+		return
+	}
+	log.Println("✓ Session ID verified")
+
+	// FIX #5: Verify device signature (proves client has device secret)
+	// Client signs: "login:{username}:{timestamp}:{nonce}"
+	loginMessage := fmt.Sprintf("login:%s:%s:%s", req.Username, req.Timestamp, req.Nonce)
+	if !VerifyHMAC(deviceSecret, loginMessage, req.DeviceSignature) {
+		log.Printf("❌ Invalid device signature (device doesn't have correct secret)")
+		http.Error(w, "Device authentication failed", http.StatusUnauthorized)
+		return
+	}
+	log.Println("✓ Device signature verified (device ownership proven)")
+
+	// Now it's safe to mark nonce as used (after all validations pass)
+	markNonceUsed(req.Nonce)
+
+	// Link device to user if not already linked
+	if device.UserID == nil {
+		_, err = db.Exec(
+			"UPDATE devices SET user_id = $1 WHERE device_id = $2",
+			user.ID, req.DeviceID,
+		)
+		if err != nil {
+			log.Printf("⚠️  Failed to link device to user: %v", err)
+		} else {
+			log.Printf("✓ Device %s linked to user %d", req.DeviceID, user.ID)
+		}
+	}
 
 	// Create session in database
 	_, err = db.Exec(
@@ -411,6 +498,18 @@ func verifyPassword(password, hash string) bool {
 	return passwordHash == hash
 }
 
+// Helper to get device secret for verification purposes
+// In production, this should decrypt from KMS/HSM
+func getDeviceSecretForVerification(serverHMACKeyEncoded string) ([]byte, error) {
+	// The stored value is actually the server HMAC key
+	// We need to return it as-is for signature verification
+	serverHMACKey, err := hex.DecodeString(serverHMACKeyEncoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode server HMAC key: %w", err)
+	}
+	return serverHMACKey, nil
+}
+
 // ============================================================================
 // PHASE 3: AUTHENTICATED REQUEST MIDDLEWARE
 // ============================================================================
@@ -441,6 +540,14 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		sessionID := parts[1]
+
+		// FIX #4: Check if session is blacklisted
+		exists, _ := rdb.Exists(ctx, fmt.Sprintf("blacklist:%s", sessionID)).Result()
+		if exists > 0 {
+			log.Printf("❌ Blacklisted session attempted: %s", sessionID)
+			http.Error(w, "Session invalidated", http.StatusUnauthorized)
+			return
+		}
 
 		// Step 1: Get session from cache or database
 		sessionData, err := getSession(sessionID)

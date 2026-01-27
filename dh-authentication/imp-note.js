@@ -1,5 +1,5 @@
 /**
- * Authentication Client - Frontend Implementation
+ * Authentication Client - Frontend Implementation (FIXED)
  * Handles device registration, login, and authenticated API requests
  */
 
@@ -11,6 +11,7 @@ class AuthClient {
     this.deviceSecret = null;
     this.sessionId = null;
     this.deviceId = null;
+    this.serverHMACKey = null;
   }
 
   // ========================================================================
@@ -65,13 +66,13 @@ class AuthClient {
     const sharedSecret = clientDH.dh.computeSecret(serverPublicKey);
     console.log('✓ Computed shared secret (never transmitted!)');
 
-    // Step 4: Derive device secret using HKDF
-    this.deviceSecret = this.deriveDeviceSecret(sharedSecret, deviceInfo);
+    // Step 4: Derive device secret using HKDF (FIXED IMPLEMENTATION)
+    this.deviceSecret = await this.deriveDeviceSecret(sharedSecret, deviceInfo);
     this.deviceId = data.device_id;
     console.log('✓ Derived device secret using HKDF');
 
     // Step 5: Derive server HMAC key (what server uses to verify our signatures)
-    this.serverHMACKey = this.deriveServerHMACKey(this.deviceSecret);
+    this.serverHMACKey = await this.deriveServerHMACKey(this.deviceSecret);
     console.log('✓ Derived server HMAC key for request signing');
 
     // Step 6: Store in secure storage (localStorage for demo, use Keychain/Keystore in production)
@@ -84,42 +85,42 @@ class AuthClient {
   }
 
   /**
-   * Derive device secret from shared secret using HKDF-SHA256
+   * FIX #1: Proper HKDF implementation using Node.js crypto.hkdf
+   * Derives device secret from shared secret using HKDF-SHA256
    * @param {Buffer} sharedSecret 
    * @param {string} info - Context information
-   * @returns {Buffer} 32-byte device secret
+   * @returns {Promise<Buffer>} 32-byte device secret
    */
-  deriveDeviceSecret(sharedSecret, info) {
-    const salt = Buffer.from('device-auth-v1'); // Use a fixed salt for deterministic derivation
-    const hkdf = crypto.createHmac('sha256', salt);
-    hkdf.update(sharedSecret);
-    const prk = hkdf.digest();
-
-    // Expand to 32 bytes
+  async deriveDeviceSecret(sharedSecret, info) {
+    const salt = Buffer.from('device-auth-v1');
     const infoBuffer = Buffer.from(info, 'utf8');
-    const hmac = crypto.createHmac('sha256', prk);
-    hmac.update(infoBuffer);
-    hmac.update(Buffer.from([0x01])); // Counter byte
-    return hmac.digest();
+    
+    return new Promise((resolve, reject) => {
+      // Use proper HKDF from Node.js crypto (Node 15+)
+      crypto.hkdf('sha256', sharedSecret, salt, infoBuffer, 32, (err, derivedKey) => {
+        if (err) reject(err);
+        else resolve(derivedKey);
+      });
+    });
   }
 
   /**
+   * FIX #1: Proper HKDF implementation for server HMAC key derivation
    * Derive server HMAC key from device secret
    * This matches what the server stores and uses for verification
    * @param {Buffer} deviceSecret 
-   * @returns {Buffer} 32-byte server HMAC key
+   * @returns {Promise<Buffer>} 32-byte server HMAC key
    */
-  deriveServerHMACKey(deviceSecret) {
+  async deriveServerHMACKey(deviceSecret) {
     const salt = Buffer.from('server-hmac-key-v1');
-    const hkdf = crypto.createHmac('sha256', salt);
-    hkdf.update(deviceSecret);
-    const prk = hkdf.digest();
-
     const info = Buffer.from('server-verification', 'utf8');
-    const hmac = crypto.createHmac('sha256', prk);
-    hmac.update(info);
-    hmac.update(Buffer.from([0x01])); // Counter byte
-    return hmac.digest();
+    
+    return new Promise((resolve, reject) => {
+      crypto.hkdf('sha256', deviceSecret, salt, info, 32, (err, derivedKey) => {
+        if (err) reject(err);
+        else resolve(derivedKey);
+      });
+    });
   }
 
   // ========================================================================
@@ -156,11 +157,17 @@ class AuthClient {
     const nonce = crypto.randomBytes(16).toString('hex');
     const sessionData = `${this.deviceId}:${timestamp}:${nonce}`;
     
-    const hmac = crypto.createHmac('sha256', this.deviceSecret);
+    // Use serverHMACKey for session ID (this is what server will verify against)
+    const hmac = crypto.createHmac('sha256', this.serverHMACKey);
     hmac.update(sessionData);
     const sessionId = hmac.digest('hex');
 
     console.log('✓ Generated session ID');
+
+    // FIX #5: Generate device signature to prove device ownership
+    const loginMessage = `login:${username}:${timestamp}:${nonce}`;
+    const deviceSignature = this.generateHMAC(this.serverHMACKey, loginMessage);
+    console.log('✓ Generated device signature');
 
     // Send login request
     const response = await fetch(`${this.apiBaseUrl}/auth/login`, {
@@ -172,7 +179,8 @@ class AuthClient {
         device_id: this.deviceId,
         session_id: sessionId,
         timestamp,
-        nonce
+        nonce,
+        device_signature: deviceSignature // FIX #5: Include proof of device ownership
       })
     });
 
@@ -261,7 +269,17 @@ class AuthClient {
    */
   generateSignature(method, path, body, timestamp, nonce) {
     const message = `${this.sessionId}:${method}:${path}:${body}:${timestamp}:${nonce}`;
-    const hmac = crypto.createHmac('sha256', this.serverHMACKey);
+    return this.generateHMAC(this.serverHMACKey, message);
+  }
+
+  /**
+   * Helper function to generate HMAC
+   * @param {Buffer} secret 
+   * @param {string} message 
+   * @returns {string} Hex-encoded HMAC
+   */
+  generateHMAC(secret, message) {
+    const hmac = crypto.createHmac('sha256', secret);
     hmac.update(message);
     return hmac.digest('hex');
   }
