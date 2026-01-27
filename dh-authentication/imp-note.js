@@ -1,6 +1,8 @@
 /**
- * Authentication Client - Frontend Implementation (FIXED)
- * Handles device registration, login, and authenticated API requests
+ * Authentication Client - Frontend Implementation (PROPERLY FIXED)
+ * - Uses X25519 (not random DH)
+ * - Only stores device_secret, derives server_hmac_key on demand
+ * - Handles device registration, login, and authenticated API requests
  */
 
 const crypto = require('crypto');
@@ -8,10 +10,9 @@ const crypto = require('crypto');
 class AuthClient {
   constructor(apiBaseUrl) {
     this.apiBaseUrl = apiBaseUrl;
-    this.deviceSecret = null;
+    this.deviceSecret = null;  // Only this is stored persistently
     this.sessionId = null;
     this.deviceId = null;
-    this.serverHMACKey = null;
   }
 
   // ========================================================================
@@ -19,16 +20,15 @@ class AuthClient {
   // ========================================================================
 
   /**
-   * Generate Diffie-Hellman keypair for device registration
-   * Uses 2048-bit modp group (can upgrade to Curve25519 for production)
+   * FIXED: Generate X25519 keypair (not random DH group)
    */
-  generateDHKeyPair() {
-    const dh = crypto.createDiffieHellman(2048);
-    dh.generateKeys();
+  generateX25519KeyPair() {
+    const ecdh = crypto.createECDH('x25519');
+    ecdh.generateKeys();
     return {
-      privateKey: dh.getPrivateKey(),
-      publicKey: dh.getPublicKey(),
-      dh: dh // Keep DH instance for computing shared secret
+      privateKey: ecdh.getPrivateKey(),
+      publicKey: ecdh.getPublicKey(),
+      ecdh: ecdh
     };
   }
 
@@ -38,18 +38,18 @@ class AuthClient {
    * @returns {Promise<string>} device_id
    */
   async registerDevice(deviceInfo) {
-    console.log('🔐 Starting device registration...');
+    console.log('🔐 Starting device registration (X25519)...');
 
-    // Step 1: Generate client DH keypair
-    const clientDH = this.generateDHKeyPair();
-    console.log('✓ Generated client DH keypair');
+    // Step 1: Generate client X25519 keypair
+    const clientECDH = this.generateX25519KeyPair();
+    console.log('✓ Generated client X25519 keypair');
 
     // Step 2: Send public key to server
     const response = await fetch(`${this.apiBaseUrl}/auth/register-device`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        public_key: clientDH.publicKey.toString('base64'),
+        public_key: clientECDH.publicKey.toString('base64'),
         device_info: deviceInfo
       })
     });
@@ -61,32 +61,28 @@ class AuthClient {
     const data = await response.json();
     console.log('✓ Received server public key');
 
-    // Step 3: Compute shared secret using server's public key
+    // Step 3: Compute shared secret using X25519
     const serverPublicKey = Buffer.from(data.server_public_key, 'base64');
-    const sharedSecret = clientDH.dh.computeSecret(serverPublicKey);
-    console.log('✓ Computed shared secret (never transmitted!)');
+    const sharedSecret = clientECDH.ecdh.computeSecret(serverPublicKey);
+    console.log('✓ Computed X25519 shared secret');
 
-    // Step 4: Derive device secret using HKDF (FIXED IMPLEMENTATION)
+    // Step 4: Derive device secret using proper HKDF
     this.deviceSecret = await this.deriveDeviceSecret(sharedSecret, deviceInfo);
     this.deviceId = data.device_id;
     console.log('✓ Derived device secret using HKDF');
 
-    // Step 5: Derive server HMAC key (what server uses to verify our signatures)
-    this.serverHMACKey = await this.deriveServerHMACKey(this.deviceSecret);
-    console.log('✓ Derived server HMAC key for request signing');
-
-    // Step 6: Store in secure storage (localStorage for demo, use Keychain/Keystore in production)
+    // Step 5: ONLY store device_secret (not server_hmac_key)
+    // We'll derive server_hmac_key on demand when needed
     this.storeSecurely('device_secret', this.deviceSecret.toString('base64'));
-    this.storeSecurely('server_hmac_key', this.serverHMACKey.toString('base64'));
     this.storeSecurely('device_id', this.deviceId);
     console.log(`✓ Device registered: ${this.deviceId}`);
+    console.log('✓ Storing only device_secret (server_hmac_key derived on demand)');
 
     return this.deviceId;
   }
 
   /**
-   * FIX #1: Proper HKDF implementation using Node.js crypto.hkdf
-   * Derives device secret from shared secret using HKDF-SHA256
+   * Proper HKDF implementation using Node.js crypto.hkdf
    * @param {Buffer} sharedSecret 
    * @param {string} info - Context information
    * @returns {Promise<Buffer>} 32-byte device secret
@@ -96,7 +92,6 @@ class AuthClient {
     const infoBuffer = Buffer.from(info, 'utf8');
     
     return new Promise((resolve, reject) => {
-      // Use proper HKDF from Node.js crypto (Node 15+)
       crypto.hkdf('sha256', sharedSecret, salt, infoBuffer, 32, (err, derivedKey) => {
         if (err) reject(err);
         else resolve(derivedKey);
@@ -105,9 +100,8 @@ class AuthClient {
   }
 
   /**
-   * FIX #1: Proper HKDF implementation for server HMAC key derivation
-   * Derive server HMAC key from device secret
-   * This matches what the server stores and uses for verification
+   * FIXED: Derive server HMAC key on demand from device secret
+   * Not stored persistently - computed when needed
    * @param {Buffer} deviceSecret 
    * @returns {Promise<Buffer>} 32-byte server HMAC key
    */
@@ -129,7 +123,6 @@ class AuthClient {
 
   /**
    * Login with username and password
-   * Generates a session authenticated with device secret
    * @param {string} username 
    * @param {string} password 
    * @returns {Promise<string>} session_id
@@ -137,36 +130,34 @@ class AuthClient {
   async login(username, password) {
     console.log('🔑 Starting login...');
 
-    // Load device credentials
+    // Load device credentials if not in memory
     if (!this.deviceSecret) {
       const storedSecret = this.retrieveSecurely('device_secret');
-      const storedHMACKey = this.retrieveSecurely('server_hmac_key');
       const storedDeviceId = this.retrieveSecurely('device_id');
       
-      if (!storedSecret || !storedHMACKey || !storedDeviceId) {
+      if (!storedSecret || !storedDeviceId) {
         throw new Error('Device not registered. Please register device first.');
       }
       
       this.deviceSecret = Buffer.from(storedSecret, 'base64');
-      this.serverHMACKey = Buffer.from(storedHMACKey, 'base64');
       this.deviceId = storedDeviceId;
     }
+
+    // Derive server HMAC key on demand (not stored)
+    const serverHMACKey = await this.deriveServerHMACKey(this.deviceSecret);
+    console.log('✓ Derived server_hmac_key from device_secret (ephemeral)');
 
     // Generate session ID using HMAC
     const timestamp = Date.now().toString();
     const nonce = crypto.randomBytes(16).toString('hex');
     const sessionData = `${this.deviceId}:${timestamp}:${nonce}`;
     
-    // Use serverHMACKey for session ID (this is what server will verify against)
-    const hmac = crypto.createHmac('sha256', this.serverHMACKey);
-    hmac.update(sessionData);
-    const sessionId = hmac.digest('hex');
-
+    const sessionId = this.generateHMAC(serverHMACKey, sessionData);
     console.log('✓ Generated session ID');
 
-    // FIX #5: Generate device signature to prove device ownership
+    // Generate device signature to prove device ownership
     const loginMessage = `login:${username}:${timestamp}:${nonce}`;
-    const deviceSignature = this.generateHMAC(this.serverHMACKey, loginMessage);
+    const deviceSignature = this.generateHMAC(serverHMACKey, loginMessage);
     console.log('✓ Generated device signature');
 
     // Send login request
@@ -180,7 +171,7 @@ class AuthClient {
         session_id: sessionId,
         timestamp,
         nonce,
-        device_signature: deviceSignature // FIX #5: Include proof of device ownership
+        device_signature: deviceSignature
       })
     });
 
@@ -192,7 +183,7 @@ class AuthClient {
     const data = await response.json();
     this.sessionId = data.session_id;
     
-    // Store session
+    // Store session (only session_id, not keys)
     this.storeSecurely('session_id', this.sessionId);
     console.log('✓ Login successful');
 
@@ -211,9 +202,12 @@ class AuthClient {
    * @returns {Promise<Object>} Response data
    */
   async authenticatedRequest(method, path, body = null) {
-    if (!this.sessionId || !this.serverHMACKey) {
+    if (!this.sessionId || !this.deviceSecret) {
       throw new Error('Not logged in. Please login first.');
     }
+
+    // Derive server HMAC key on demand (not stored)
+    const serverHMACKey = await this.deriveServerHMACKey(this.deviceSecret);
 
     const timestamp = Date.now().toString();
     const nonce = crypto.randomBytes(16).toString('hex');
@@ -221,6 +215,7 @@ class AuthClient {
 
     // Generate HMAC signature
     const signature = this.generateSignature(
+      serverHMACKey,
       method,
       path,
       bodyString,
@@ -228,7 +223,7 @@ class AuthClient {
       nonce
     );
 
-    console.log(`📤 ${method} ${path} (signed)`);
+    console.log(`📤 ${method} ${path} (signed with ephemeral key)`);
 
     // Make request
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
@@ -259,7 +254,8 @@ class AuthClient {
   }
 
   /**
-   * Generate HMAC signature for request using server HMAC key
+   * Generate HMAC signature for request
+   * @param {Buffer} serverHMACKey - Derived on demand
    * @param {string} method 
    * @param {string} path 
    * @param {string} body 
@@ -267,9 +263,9 @@ class AuthClient {
    * @param {string} nonce 
    * @returns {string} Hex-encoded signature
    */
-  generateSignature(method, path, body, timestamp, nonce) {
+  generateSignature(serverHMACKey, method, path, body, timestamp, nonce) {
     const message = `${this.sessionId}:${method}:${path}:${body}:${timestamp}:${nonce}`;
-    return this.generateHMAC(this.serverHMACKey, message);
+    return this.generateHMAC(serverHMACKey, message);
   }
 
   /**
@@ -310,7 +306,7 @@ class AuthClient {
   }
 
   /**
-   * Clear session data
+   * Clear session data (but keep device_secret)
    */
   clearSession() {
     this.sessionId = null;
@@ -320,10 +316,15 @@ class AuthClient {
   }
 
   // ========================================================================
-  // SECURE STORAGE (Use platform-specific secure storage in production)
+  // SECURE STORAGE
   // ========================================================================
 
   storeSecurely(key, value) {
+    // In production:
+    // - iOS: Use Keychain
+    // - Android: Use Keystore
+    // - Web: Use IndexedDB with encryption
+    // - Desktop: Use system keyring
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(key, value);
     }
@@ -353,6 +354,7 @@ async function example() {
     });
     
     await client.registerDevice(deviceInfo);
+    console.log('\n💡 Note: Only device_secret stored. server_hmac_key derived on demand.\n');
 
     // Login
     await client.login('john.doe', 'securePassword123');
