@@ -70,8 +70,13 @@ class AuthClient {
     this.deviceId = data.device_id;
     console.log('✓ Derived device secret using HKDF');
 
-    // Step 5: Store in secure storage (localStorage for demo, use Keychain/Keystore in production)
+    // Step 5: Derive server HMAC key (what server uses to verify our signatures)
+    this.serverHMACKey = this.deriveServerHMACKey(this.deviceSecret);
+    console.log('✓ Derived server HMAC key for request signing');
+
+    // Step 6: Store in secure storage (localStorage for demo, use Keychain/Keystore in production)
     this.storeSecurely('device_secret', this.deviceSecret.toString('base64'));
+    this.storeSecurely('server_hmac_key', this.serverHMACKey.toString('base64'));
     this.storeSecurely('device_id', this.deviceId);
     console.log(`✓ Device registered: ${this.deviceId}`);
 
@@ -98,6 +103,25 @@ class AuthClient {
     return hmac.digest();
   }
 
+  /**
+   * Derive server HMAC key from device secret
+   * This matches what the server stores and uses for verification
+   * @param {Buffer} deviceSecret 
+   * @returns {Buffer} 32-byte server HMAC key
+   */
+  deriveServerHMACKey(deviceSecret) {
+    const salt = Buffer.from('server-hmac-key-v1');
+    const hkdf = crypto.createHmac('sha256', salt);
+    hkdf.update(deviceSecret);
+    const prk = hkdf.digest();
+
+    const info = Buffer.from('server-verification', 'utf8');
+    const hmac = crypto.createHmac('sha256', prk);
+    hmac.update(info);
+    hmac.update(Buffer.from([0x01])); // Counter byte
+    return hmac.digest();
+  }
+
   // ========================================================================
   // PHASE 2: LOGIN
   // ========================================================================
@@ -115,13 +139,15 @@ class AuthClient {
     // Load device credentials
     if (!this.deviceSecret) {
       const storedSecret = this.retrieveSecurely('device_secret');
+      const storedHMACKey = this.retrieveSecurely('server_hmac_key');
       const storedDeviceId = this.retrieveSecurely('device_id');
       
-      if (!storedSecret || !storedDeviceId) {
+      if (!storedSecret || !storedHMACKey || !storedDeviceId) {
         throw new Error('Device not registered. Please register device first.');
       }
       
       this.deviceSecret = Buffer.from(storedSecret, 'base64');
+      this.serverHMACKey = Buffer.from(storedHMACKey, 'base64');
       this.deviceId = storedDeviceId;
     }
 
@@ -177,7 +203,7 @@ class AuthClient {
    * @returns {Promise<Object>} Response data
    */
   async authenticatedRequest(method, path, body = null) {
-    if (!this.sessionId || !this.deviceSecret) {
+    if (!this.sessionId || !this.serverHMACKey) {
       throw new Error('Not logged in. Please login first.');
     }
 
@@ -225,7 +251,7 @@ class AuthClient {
   }
 
   /**
-   * Generate HMAC signature for request
+   * Generate HMAC signature for request using server HMAC key
    * @param {string} method 
    * @param {string} path 
    * @param {string} body 
@@ -235,7 +261,7 @@ class AuthClient {
    */
   generateSignature(method, path, body, timestamp, nonce) {
     const message = `${this.sessionId}:${method}:${path}:${body}:${timestamp}:${nonce}`;
-    const hmac = crypto.createHmac('sha256', this.deviceSecret);
+    const hmac = crypto.createHmac('sha256', this.serverHMACKey);
     hmac.update(message);
     return hmac.digest('hex');
   }

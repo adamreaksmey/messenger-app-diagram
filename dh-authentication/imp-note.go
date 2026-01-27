@@ -94,7 +94,7 @@ func initDatabase() error {
 	CREATE TABLE IF NOT EXISTS devices (
 		device_id VARCHAR(64) PRIMARY KEY,
 		user_id INTEGER REFERENCES users(id),
-		device_secret_hash VARCHAR(64) NOT NULL,
+		device_secret_hash VARCHAR(128) NOT NULL,  -- Actually stores server_hmac_key (hex-encoded), should rename to server_hmac_key
 		device_info TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
@@ -185,10 +185,18 @@ func DeriveDeviceSecret(sharedSecret []byte, info string) ([]byte, error) {
 	return deviceSecret, nil
 }
 
-// HashSecret creates SHA256 hash of secret for storage
-func HashSecret(secret []byte) string {
-	hash := sha256.Sum256(secret)
-	return hex.EncodeToString(hash[:])
+// DeriveServerHMACKey derives a separate server-side HMAC verification key
+// This is what the server stores and uses to verify client signatures
+func DeriveServerHMACKey(deviceSecret []byte) ([]byte, error) {
+	salt := []byte("server-hmac-key-v1")
+	h := hkdf.New(sha256.New, deviceSecret, salt, []byte("server-verification"))
+
+	serverKey := make([]byte, 32)
+	if _, err := io.ReadFull(h, serverKey); err != nil {
+		return nil, err
+	}
+
+	return serverKey, nil
 }
 
 // GenerateHMAC generates HMAC-SHA256 signature
@@ -254,8 +262,16 @@ func registerDeviceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hash device secret for storage
-	deviceSecretHash := HashSecret(deviceSecret)
+	// Derive server-side HMAC verification key
+	// This is what we store - NOT the device_secret itself
+	serverHMACKey, err := DeriveServerHMACKey(deviceSecret)
+	if err != nil {
+		http.Error(w, "Failed to derive verification key", http.StatusInternalServerError)
+		return
+	}
+
+	// Encode for storage (in production, encrypt this with KMS/HSM)
+	serverHMACKeyEncoded := hex.EncodeToString(serverHMACKey)
 
 	// Generate device ID
 	deviceID := generateDeviceID()
@@ -263,7 +279,7 @@ func registerDeviceHandler(w http.ResponseWriter, r *http.Request) {
 	// Store device in database
 	_, err = db.Exec(
 		"INSERT INTO devices (device_id, device_secret_hash, device_info) VALUES ($1, $2, $3)",
-		deviceID, deviceSecretHash, req.DeviceInfo,
+		deviceID, serverHMACKeyEncoded, req.DeviceInfo,
 	)
 	if err != nil {
 		http.Error(w, "Failed to store device", http.StatusInternalServerError)
@@ -514,12 +530,14 @@ func getSession(sessionID string) (map[string]interface{}, error) {
 	return sessionData, nil
 }
 
-func getDeviceSecret(deviceSecretHash string) ([]byte, error) {
-	// In a real system, you'd need to store or derive the actual device secret
-	// This is a simplified version - you might cache device secrets separately
-	// For this demo, we'll return a placeholder
-	// NOTE: In production, consider how you'll handle device secret retrieval
-	return []byte(deviceSecretHash), nil
+func getDeviceSecret(serverHMACKeyEncoded string) ([]byte, error) {
+	// Decode the server HMAC key from storage
+	// In production, this should be decrypted using KMS/HSM
+	serverHMACKey, err := hex.DecodeString(serverHMACKeyEncoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode server HMAC key: %w", err)
+	}
+	return serverHMACKey, nil
 }
 
 func isTimestampValid(ts int64) bool {
@@ -625,8 +643,13 @@ func main() {
 	r.HandleFunc("/api/messages", authMiddleware(getMessagesHandler)).Methods("GET")
 	r.HandleFunc("/api/messages/send", authMiddleware(sendMessageHandler)).Methods("POST")
 
-	// Start server
+	// CRITICAL: In production, MUST use TLS to prevent MITM attacks during DH key exchange
+	// Use ListenAndServeTLS instead:
+	// log.Fatal(http.ListenAndServeTLS(config.ServerPort, "server.crt", "server.key", r))
+
 	log.Printf("🚀 Auth service running on %s", config.ServerPort)
+	log.Println("⚠️  WARNING: Running without TLS - VULNERABLE TO MITM ATTACKS")
+	log.Println("⚠️  Use HTTPS in production to authenticate server's DH public key")
 	log.Fatal(http.ListenAndServe(config.ServerPort, r))
 }
 
