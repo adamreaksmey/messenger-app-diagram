@@ -363,7 +363,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get server HMAC key for verification - CORRECT function name
+	// Get server HMAC key for verification
 	serverHMACKey, err := getServerHMACKey(device.ServerHMACKey)
 	if err != nil {
 		log.Printf("❌ Failed to retrieve server HMAC key: %v", err)
@@ -375,6 +375,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	expectedSessionData := fmt.Sprintf("%s:%s:%s", req.DeviceID, req.Timestamp, req.Nonce)
 	expectedSessionID := GenerateHMAC(serverHMACKey, expectedSessionData)
 
+	// Verify that the client’s session ID matches what the server expects.
+	// Uses constant-time comparison to prevent timing attacks.
 	if !subtle.ConstantTimeCompare([]byte(req.SessionID), []byte(expectedSessionID)) {
 		log.Printf("❌ Invalid session ID")
 		http.Error(w, "Invalid session ID", http.StatusUnauthorized)
@@ -509,6 +511,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// FIXED: Check nonce with SESSION SCOPE (not global)
+		// nonce must be generated on every request.
 		if isNonceUsedForSession(sessionID, nonce) {
 			http.Error(w, "Nonce already used", http.StatusUnauthorized)
 			return

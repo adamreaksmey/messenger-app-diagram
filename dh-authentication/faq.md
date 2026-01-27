@@ -4,6 +4,69 @@ This FAQ covers the implementation in:
 - **Frontend**: `dh-authentication/imp-note.js` (`AuthClient` methods)
 - **Backend**: `dh-authentication/imp-note.go` (handlers + crypto helpers)
 
+Pre-stuff:
+1. What is nonce?
+- Nonce is a random value that is used once and never reused.
+### Why do we need a nonce?
+
+Because HMAC alone does NOT stop replay attacks.
+
+Without a nonce
+- An attacker could:
+- Capture a valid request
+- Re-send it later
+- Server sees a valid HMAC
+- Request is accepted again
+
+That’s what a replay attack is.
+
+### What the nonce prevents
+
+By including a nonce in the signed message:
+HMAC(device_secret, message + nonce)
+
+You guarantee:
+- The signature is valid only once
+- Replaying the same request fails
+- Even if everything else is identical
+- The server remembers used nonces and rejects duplicates.
+
+### When does a nonce get generated:
+The **nonce** is generated on the **client side** (mobile/desktop) **during login or any authenticated request**. It’s not part of device registration.
+
+In your frontend code:
+
+```js
+const nonce = crypto.randomBytes(16).toString('hex');
+```
+
+* **When:** Each time you log in (or send an authenticated request).
+* **Where:** Right before you generate the session ID and device signature.
+* **Purpose:** Ensures that each request is unique and prevents **replay attacks**.
+
+The **backend** then checks:
+
+```go
+if isNonceUsed(deviceID, nonce) { ... }
+```
+
+* If the same nonce has been used for that device/session before, the request is rejected.
+
+So mathematically / logically:
+
+1. Client picks a random 16-byte value → `nonce`.
+2. `nonce` is included in the session ID HMAC and device signature:
+
+```
+session_id = HMAC(server_hmac_key, device_id + ":" + timestamp + ":" + nonce)
+device_signature = HMAC(server_hmac_key, "login:" + username + ":" + timestamp + ":" + nonce)
+```
+
+3. Server verifies both **timestamp** and **nonce** to ensure freshness and uniqueness.
+
+✅ Key point: **the nonce is always freshly generated per login/request by the client**.
+
+
 ---
 
 ### 1) What “token” are we generating here — is it a JWT?

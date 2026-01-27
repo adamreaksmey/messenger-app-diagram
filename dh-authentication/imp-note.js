@@ -348,9 +348,8 @@ async function example() {
   try {
     // Register device (first time only)
     const deviceInfo = JSON.stringify({
-      os: 'Linux',
-      model: 'Desktop',
-      app_version: '1.0.0'
+      "type": "mobile",
+      "os": "android",
     });
     
     await client.registerDevice(deviceInfo);
