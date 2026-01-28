@@ -377,7 +377,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Verify that the client’s session ID matches what the server expects.
 	// Uses constant-time comparison to prevent timing attacks.
-	if !subtle.ConstantTimeCompare([]byte(req.SessionID), []byte(expectedSessionID)) {
+	if subtle.ConstantTimeCompare([]byte(req.SessionID), []byte(expectedSessionID)) != 1 {
 		log.Printf("❌ Invalid session ID")
 		http.Error(w, "Invalid session ID", http.StatusUnauthorized)
 		return
