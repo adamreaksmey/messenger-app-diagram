@@ -1,388 +1,111 @@
-# JWT Authentication Implementation Plan (Login-Based)
+# Simple Mobile/Desktop Chat Authentication Implementation Plan
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Phase 1: User-Service - Session Management](#phase-1-user-service---session-management)
+  - [1.1 Update Session Configuration](#11-update-session-configuration)
+  - [1.2 Update Database Schema](#12-update-database-schema)
+  - [1.3 Update Login to Create Long-Lived Sessions](#13-update-login-to-create-long-lived-sessions)
+  - [1.4 Add Session Validation Endpoint (for chat-service to use)](#14-add-session-validation-endpoint-for-chat-service-to-use)
+  - [1.5 Add Logout Endpoint](#15-add-logout-endpoint)
+  - [1.6 Register Routes](#16-register-routes)
+- [Phase 2: Chat-Service - Session Validation](#phase-2-chat-service---session-validation)
+  - [2.1 Setup Configuration](#21-setup-configuration)
+  - [2.2 Session Data Model](#22-session-data-model)
+  - [2.3 Session Validator (with Redis + user-service fallback)](#23-session-validator-with-redis--user-service-fallback)
+  - [2.4 Authentication Middleware](#24-authentication-middleware)
+  - [2.5 Setup Chat Service](#25-setup-chat-service)
+  - [2.6 Protected Handlers Example](#26-protected-handlers-example)
+- [Phase 3: Mobile/Desktop Client Implementation](#phase-3-mobiledesktop-client-implementation)
+  - [3.1 Secure Storage Setup](#31-secure-storage-setup)
+  - [3.2 Authentication Service](#32-authentication-service)
+  - [3.3 Chat API Service](#33-chat-api-service)
+  - [3.4 Usage Example](#34-usage-example)
+- [Phase 4: Testing & Validation](#phase-4-testing--validation)
+  - [4.1 Manual Testing](#41-manual-testing)
+  - [4.2 Test Checklist](#42-test-checklist)
+  - [4.3 Performance Testing](#43-performance-testing)
+- [Phase 5: Production Setup](#phase-5-production-setup)
+  - [5.1 Environment Variables](#51-environment-variables)
+  - [5.2 Docker Compose (for local development)](#52-docker-compose-for-local-development)
+  - [5.3 Security Checklist](#53-security-checklist)
+  - [5.4 Cleanup Job (Optional)](#54-cleanup-job-optional)
+- [Summary](#summary)
+  - [Architecture](#architecture)
+  - [Performance](#performance)
+  - [Implementation Time](#implementation-time)
+  - [Key Benefits](#key-benefits)
+
+---
 
 ## Overview
-- JWT key pair generation happens **during login** (not registration)
-- Registration only handles device registration (DH + HMAC)
-- Login validates credentials, generates JWT tokens, stores refresh token
-- Chat-service verifies JWTs independently
+- **No JWT complexity** - just session IDs
+- **No web concerns** - mobile/desktop only (no cookies, CORS, XSS)
+- **Database as source of truth** - Redis as fast cache
+- Session ID passed via `Authorization: Bearer <session_id>` header
+- "Forever" login via long-lived sessions (1 year, refreshed on activity)
 
 ---
 
-## Phase 1: RSA Key Generation & Management
+## Phase 1: User-Service - Session Management
 
-### 1.1 Generate RSA Key Pair (One-time setup for user-service)
-
-```go
-// cmd/keygen/main.go
-package main
-
-import (
-    "crypto/rand"
-    "crypto/rsa"
-    "crypto/x509"
-    "encoding/pem"
-    "log"
-    "os"
-)
-
-func main() {
-    // Generate 2048-bit RSA key pair
-    privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-    if err != nil {
-        log.Fatal("Failed to generate private key:", err)
-    }
-
-    // Save private key
-    privateKeyFile, err := os.Create("keys/jwt_private_key.pem")
-    if err != nil {
-        log.Fatal("Failed to create private key file:", err)
-    }
-    defer privateKeyFile.Close()
-
-    privateKeyBytes := x509.MarshalPKCS1PrivateKey(privateKey)
-    privateKeyPEM := &pem.Block{
-        Type:  "RSA PRIVATE KEY",
-        Bytes: privateKeyBytes,
-    }
-    if err := pem.Encode(privateKeyFile, privateKeyPEM); err != nil {
-        log.Fatal("Failed to write private key:", err)
-    }
-    log.Println("✓ Private key saved to keys/jwt_private_key.pem")
-
-    // Save public key
-    publicKeyFile, err := os.Create("keys/jwt_public_key.pem")
-    if err != nil {
-        log.Fatal("Failed to create public key file:", err)
-    }
-    defer publicKeyFile.Close()
-
-    publicKeyBytes, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
-    if err != nil {
-        log.Fatal("Failed to marshal public key:", err)
-    }
-    publicKeyPEM := &pem.Block{
-        Type:  "PUBLIC KEY",
-        Bytes: publicKeyBytes,
-    }
-    if err := pem.Encode(publicKeyFile, publicKeyPEM); err != nil {
-        log.Fatal("Failed to write public key:", err)
-    }
-    log.Println("✓ Public key saved to keys/jwt_public_key.pem")
-}
-```
-
-**Action items:**
-- [ ] Create `keys/` directory in user-service root
-- [ ] Run: `go run cmd/keygen/main.go`
-- [ ] Secure private key (chmod 600, never commit to git)
-- [ ] Add `keys/*.pem` to .gitignore
-
----
-
-## Phase 2: User-Service - JWT Generation
-
-### 2.1 Load RSA Private Key at Startup
+### 1.1 Update Session Configuration
 
 ```go
-// internal/auth/keys.go
-package auth
-
-import (
-    "crypto/rsa"
-    "crypto/x509"
-    "encoding/pem"
-    "fmt"
-    "os"
-)
-
-var jwtPrivateKey *rsa.PrivateKey
-
-func LoadPrivateKey(filepath string) error {
-    keyData, err := os.ReadFile(filepath)
-    if err != nil {
-        return fmt.Errorf("failed to read private key: %w", err)
-    }
-
-    block, _ := pem.Decode(keyData)
-    if block == nil {
-        return fmt.Errorf("failed to decode PEM block")
-    }
-
-    privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-    if err != nil {
-        return fmt.Errorf("failed to parse private key: %w", err)
-    }
-
-    jwtPrivateKey = privateKey
-    return nil
+// internal/config/config.go
+type SessionConfig struct {
+    CacheTTL     time.Duration // Redis cache TTL (1 hour)
+    DatabaseTTL  time.Duration // Database session TTL (1 year)
 }
 
-func GetPrivateKey() *rsa.PrivateKey {
-    return jwtPrivateKey
-}
-```
-
-```go
-// cmd/server/main.go
-func main() {
-    // ... existing setup ...
-
-    // Load JWT private key
-    if err := auth.LoadPrivateKey("keys/jwt_private_key.pem"); err != nil {
-        logger.Fatal("Failed to load JWT private key", "error", err)
-    }
-    logger.Info("✓ JWT private key loaded")
-
-    // ... rest of server setup ...
-}
-```
-
-### 2.2 JWT Claims Structure
-
-```go
-// internal/auth/jwt.go
-package auth
-
-import (
-    "crypto/rand"
-    "encoding/base64"
-    "fmt"
-    "time"
-
-    "github.com/golang-jwt/jwt/v5"
-)
-
-type JWTClaims struct {
-    UserID   string `json:"user_id"`
-    DeviceID string `json:"device_id"`
-    jwt.RegisteredClaims
-}
-
-const (
-    AccessTokenExpiry  = 2 * time.Hour
-    RefreshTokenExpiry = 30 * 24 * time.Hour // 30 days
-)
-```
-
-### 2.3 Token Generation Functions
-
-```go
-// internal/auth/jwt.go
-
-func GenerateAccessToken(userID, deviceID string) (string, error) {
-    privateKey := GetPrivateKey()
-    if privateKey == nil {
-        return "", fmt.Errorf("JWT private key not loaded")
-    }
-
-    claims := JWTClaims{
-        UserID:   userID,
-        DeviceID: deviceID,
-        RegisteredClaims: jwt.RegisteredClaims{
-            ExpiresAt: jwt.NewNumericDate(time.Now().Add(AccessTokenExpiry)),
-            IssuedAt:  jwt.NewNumericDate(time.Now()),
-            Issuer:    "user-service",
-            Subject:   userID,
+func LoadConfig() *Config {
+    return &Config{
+        Session: SessionConfig{
+            CacheTTL:    1 * time.Hour,
+            DatabaseTTL: 365 * 24 * time.Hour, // 1 year
         },
     }
-
-    token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-    return token.SignedString(privateKey)
-}
-
-func GenerateRefreshToken() (string, error) {
-    // Opaque token (32 random bytes)
-    b := make([]byte, 32)
-    if _, err := rand.Read(b); err != nil {
-        return "", err
-    }
-    return base64.URLEncoding.EncodeToString(b), nil
-}
-
-type TokenPair struct {
-    AccessToken  string `json:"access_token"`
-    RefreshToken string `json:"refresh_token"`
-    ExpiresIn    int    `json:"expires_in"` // seconds
-    TokenType    string `json:"token_type"`
-}
-
-func GenerateTokenPair(userID, deviceID string) (*TokenPair, error) {
-    accessToken, err := GenerateAccessToken(userID, deviceID)
-    if err != nil {
-        return nil, fmt.Errorf("failed to generate access token: %w", err)
-    }
-
-    refreshToken, err := GenerateRefreshToken()
-    if err != nil {
-        return nil, fmt.Errorf("failed to generate refresh token: %w", err)
-    }
-
-    return &TokenPair{
-        AccessToken:  accessToken,
-        RefreshToken: refreshToken,
-        ExpiresIn:    int(AccessTokenExpiry.Seconds()),
-        TokenType:    "Bearer",
-    }, nil
 }
 ```
 
-### 2.4 Database Schema for Refresh Tokens
+### 1.2 Update Database Schema
 
 ```sql
--- migrations/003_create_refresh_tokens.sql
+-- migrations/004_update_sessions_for_long_lived.sql
 
-CREATE TABLE refresh_tokens (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    token VARCHAR(255) UNIQUE NOT NULL,
-    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    device_id UUID NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NOT NULL,
-    revoked BOOLEAN DEFAULT FALSE,
-    revoked_at TIMESTAMP,
-    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+-- Make expires_at nullable for "forever" sessions
+ALTER TABLE user_sessions 
+ALTER COLUMN expires_at DROP NOT NULL;
 
-CREATE INDEX idx_refresh_token ON refresh_tokens(token);
-CREATE INDEX idx_refresh_device ON refresh_tokens(device_id);
-CREATE INDEX idx_refresh_user ON refresh_tokens(user_id);
-CREATE INDEX idx_refresh_expires ON refresh_tokens(expires_at);
-CREATE UNIQUE INDEX idx_one_token_per_device ON refresh_tokens(device_id) WHERE revoked = FALSE;
+-- Set default to 1 year from now
+ALTER TABLE user_sessions 
+ALTER COLUMN expires_at SET DEFAULT NOW() + INTERVAL '1 year';
+
+-- Add index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_user_sessions_lookup 
+ON user_sessions(session_id, is_active) 
+WHERE is_active = true;
+
+-- Add last_activity_at for tracking
+ALTER TABLE user_sessions 
+ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_activity 
+ON user_sessions(last_activity_at);
 ```
 
-### 2.5 Refresh Token Repository
-
-```go
-// internal/repository/refresh_token_repository.go
-package repository
-
-import (
-    "context"
-    "database/sql"
-    "fmt"
-    "time"
-
-    "github.com/google/uuid"
-)
-
-type RefreshTokenRepository interface {
-    Store(ctx context.Context, token, userID, deviceID string, expiresAt time.Time) error
-    Validate(ctx context.Context, token string) (userID, deviceID string, err error)
-    Revoke(ctx context.Context, token string) error
-    RevokeAllForUser(ctx context.Context, userID string) error
-    RevokeForDevice(ctx context.Context, deviceID string) error
-}
-
-type refreshTokenRepository struct {
-    db *sql.DB
-}
-
-func NewRefreshTokenRepository(db *sql.DB) RefreshTokenRepository {
-    return &refreshTokenRepository{db: db}
-}
-
-func (r *refreshTokenRepository) Store(ctx context.Context, token, userID, deviceID string, expiresAt time.Time) error {
-    _, err := r.db.ExecContext(ctx, `
-        INSERT INTO refresh_tokens (token, user_id, device_id, expires_at)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (device_id) WHERE revoked = FALSE
-        DO UPDATE SET 
-            token = EXCLUDED.token,
-            created_at = CURRENT_TIMESTAMP,
-            expires_at = EXCLUDED.expires_at,
-            last_used_at = CURRENT_TIMESTAMP
-    `, token, userID, deviceID, expiresAt)
-    
-    return err
-}
-
-func (r *refreshTokenRepository) Validate(ctx context.Context, token string) (userID, deviceID string, err error) {
-    var revoked bool
-    var expiresAt time.Time
-    
-    err = r.db.QueryRowContext(ctx, `
-        SELECT user_id, device_id, revoked, expires_at 
-        FROM refresh_tokens 
-        WHERE token = $1
-    `, token).Scan(&userID, &deviceID, &revoked, &expiresAt)
-    
-    if err == sql.ErrNoRows {
-        return "", "", fmt.Errorf("invalid refresh token")
-    }
-    if err != nil {
-        return "", "", err
-    }
-    
-    if revoked {
-        return "", "", fmt.Errorf("refresh token revoked")
-    }
-    
-    if time.Now().After(expiresAt) {
-        return "", "", fmt.Errorf("refresh token expired")
-    }
-    
-    // Update last_used_at asynchronously
-    go r.db.ExecContext(context.Background(), 
-        "UPDATE refresh_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token = $1", token)
-    
-    return userID, deviceID, nil
-}
-
-func (r *refreshTokenRepository) Revoke(ctx context.Context, token string) error {
-    _, err := r.db.ExecContext(ctx, `
-        UPDATE refresh_tokens 
-        SET revoked = TRUE, revoked_at = CURRENT_TIMESTAMP 
-        WHERE token = $1
-    `, token)
-    return err
-}
-
-func (r *refreshTokenRepository) RevokeAllForUser(ctx context.Context, userID string) error {
-    _, err := r.db.ExecContext(ctx, `
-        UPDATE refresh_tokens 
-        SET revoked = TRUE, revoked_at = CURRENT_TIMESTAMP 
-        WHERE user_id = $1 AND revoked = FALSE
-    `, userID)
-    return err
-}
-
-func (r *refreshTokenRepository) RevokeForDevice(ctx context.Context, deviceID string) error {
-    _, err := r.db.ExecContext(ctx, `
-        UPDATE refresh_tokens 
-        SET revoked = TRUE, revoked_at = CURRENT_TIMESTAMP 
-        WHERE device_id = $1 AND revoked = FALSE
-    `, deviceID)
-    return err
-}
-```
-
-### 2.6 Update Login Response
-
-```go
-// internal/models/response/auth_response.go
-package response
-
-type AuthResponse struct {
-    SessionID    string       `json:"session_id"`
-    AccessToken  string       `json:"access_token"`
-    RefreshToken string       `json:"refresh_token"`
-    ExpiresIn    int          `json:"expires_in"`
-    TokenType    string       `json:"token_type"`
-    User         UserResponse `json:"user"`
-}
-```
-
-### 2.7 Update LoginWithPassword to Generate JWT
+### 1.3 Update Login to Create Long-Lived Sessions
 
 ```go
 // internal/service/auth_service.go
 
 func (s *authService) LoginWithPassword(ctx context.Context, request *request.LoginRequest) (*response.AuthResponse, error) {
-    // ... [Steps 1-8 remain exactly the same] ...
+    // ... [Steps 1-8 remain exactly the same - your existing validation] ...
 
-    // 9. create session in db
+    // 9. Create session in DB with long expiry
     sessionID := request.SessionID
-    expiresAt := time.Now().Add(s.config.Session.Expiration)
+    expiresAt := time.Now().Add(s.config.Session.DatabaseTTL) // 1 year
 
     session := &models.UserSession{
         SessionID:      sessionID,
@@ -401,41 +124,22 @@ func (s *authService) LoginWithPassword(ctx context.Context, request *request.Lo
         return nil, apperrors.InternalServer(constants.ErrInternalServer)
     }
 
-    // 10. cache session in redis
+    // 10. Cache session in Redis with SHORT TTL (will be refreshed)
     sessionData := &repository.SessionData{
         UserID:        user.UserID.String(),
         DeviceID:      device.DeviceID.String(),
         ServerHMACKey: device.ServerHMACKey,
     }
 
-    err = s.sessionRepo.SetSessionCache(ctx, sessionID, sessionData, s.config.Session.Expiration)
+    err = s.sessionRepo.SetSessionCache(ctx, sessionID, sessionData, s.config.Session.CacheTTL) // 1 hour
     if err != nil {
         logger.Warn("failed to cache session", "error", err)
     }
 
-    // 11. Generate JWT token pair (NEW)
-    tokens, err := auth.GenerateTokenPair(user.UserID.String(), device.DeviceID.String())
-    if err != nil {
-        logger.Error("failed to generate JWT tokens", "error", err)
-        return nil, apperrors.InternalServer(constants.ErrInternalServer)
-    }
-
-    // 12. Store refresh token (NEW)
-    refreshExpiresAt := time.Now().Add(auth.RefreshTokenExpiry)
-    err = s.refreshTokenRepo.Store(ctx, tokens.RefreshToken, user.UserID.String(), device.DeviceID.String(), refreshExpiresAt)
-    if err != nil {
-        logger.Error("failed to store refresh token", "error", err)
-        return nil, apperrors.InternalServer(constants.ErrInternalServer)
-    }
-
-    logger.Info("✓ JWT tokens generated and stored", "userId", user.UserID, "deviceId", device.DeviceID)
+    logger.Info("✓ Session created", "userId", user.UserID, "deviceId", device.DeviceID, "expiresAt", expiresAt)
 
     return &response.AuthResponse{
-        SessionID:    sessionID,
-        AccessToken:  tokens.AccessToken,
-        RefreshToken: tokens.RefreshToken,
-        ExpiresIn:    tokens.ExpiresIn,
-        TokenType:    tokens.TokenType,
+        SessionID: sessionID, // Client stores this securely
         User: response.UserResponse{
             UserID:      user.UserID.String(),
             Username:    user.Username,
@@ -448,69 +152,144 @@ func (s *authService) LoginWithPassword(ctx context.Context, request *request.Lo
 }
 ```
 
-### 2.8 Add Refresh Token Endpoint
+### 1.4 Add Session Validation Endpoint (for chat-service to use)
 
 ```go
-// internal/models/request/refresh_request.go
+// internal/models/request/validate_session_request.go
 package request
 
-type RefreshRequest struct {
-    RefreshToken string `json:"refresh_token" validate:"required"`
+type ValidateSessionRequest struct {
+    SessionID string `json:"session_id" validate:"required"`
 }
 ```
 
 ```go
-// internal/models/response/refresh_response.go
+// internal/models/response/validate_session_response.go
 package response
 
-type RefreshResponse struct {
-    AccessToken string `json:"access_token"`
-    ExpiresIn   int    `json:"expires_in"`
-    TokenType   string `json:"token_type"`
+type ValidateSessionResponse struct {
+    Valid    bool   `json:"valid"`
+    UserID   string `json:"user_id,omitempty"`
+    DeviceID string `json:"device_id,omitempty"`
 }
 ```
 
 ```go
 // internal/service/auth_service.go
 
-func (s *authService) RefreshAccessToken(ctx context.Context, request *request.RefreshRequest) (*response.RefreshResponse, error) {
-    // Validate refresh token
-    userID, deviceID, err := s.refreshTokenRepo.Validate(ctx, request.RefreshToken)
-    if err != nil {
-        logger.Error("invalid refresh token", "error", err)
-        return nil, apperrors.Unauthorized(constants.ErrInvalidRefreshToken)
+func (s *authService) ValidateSession(ctx context.Context, sessionID string) (*response.ValidateSessionResponse, error) {
+    // Check Redis cache first
+    sessionData, err := s.sessionRepo.GetSessionCache(ctx, sessionID)
+    if err == nil {
+        // Cache hit - update last activity asynchronously
+        go s.updateLastActivity(sessionID)
+        
+        return &response.ValidateSessionResponse{
+            Valid:    true,
+            UserID:   sessionData.UserID,
+            DeviceID: sessionData.DeviceID,
+        }, nil
     }
 
-    // Generate new access token
-    accessToken, err := auth.GenerateAccessToken(userID, deviceID)
+    // Cache miss - check database
+    session, err := s.sessionRepo.GetBySessionID(ctx, sessionID)
     if err != nil {
-        logger.Error("failed to generate access token", "error", err)
-        return nil, apperrors.InternalServer(constants.ErrInternalServer)
+        return &response.ValidateSessionResponse{Valid: false}, nil
     }
 
-    logger.Info("✓ Access token refreshed", "userId", userID, "deviceId", deviceID)
+    // Verify session is still valid
+    if !session.IsActive {
+        return &response.ValidateSessionResponse{Valid: false}, nil
+    }
 
-    return &response.RefreshResponse{
-        AccessToken: accessToken,
-        ExpiresIn:   int(auth.AccessTokenExpiry.Seconds()),
-        TokenType:   "Bearer",
+    if session.ExpiresAt != nil && time.Now().After(*session.ExpiresAt) {
+        return &response.ValidateSessionResponse{Valid: false}, nil
+    }
+
+    // Cache it for next time
+    sessionData = &repository.SessionData{
+        UserID:   session.UserID.String(),
+        DeviceID: session.DeviceID.String(),
+    }
+    
+    s.sessionRepo.SetSessionCache(ctx, sessionID, sessionData, s.config.Session.CacheTTL)
+    
+    // Update last activity
+    go s.updateLastActivity(sessionID)
+
+    return &response.ValidateSessionResponse{
+        Valid:    true,
+        UserID:   session.UserID.String(),
+        DeviceID: session.DeviceID.String(),
     }, nil
+}
+
+func (s *authService) updateLastActivity(sessionID string) {
+    ctx := context.Background()
+    s.sessionRepo.UpdateLastActivity(ctx, sessionID)
+}
+```
+
+```go
+// internal/repository/session_repository.go
+
+func (r *sessionRepository) GetBySessionID(ctx context.Context, sessionID string) (*models.UserSession, error) {
+    var session models.UserSession
+    
+    err := r.db.QueryRowContext(ctx, `
+        SELECT session_id, user_id, device_id, device_info, ip_address, 
+               expires_at, last_activity_at, is_active, created_at, updated_at
+        FROM user_sessions
+        WHERE session_id = $1
+    `, sessionID).Scan(
+        &session.SessionID,
+        &session.UserID,
+        &session.DeviceID,
+        &session.DeviceInfo,
+        &session.IPAddress,
+        &session.ExpiresAt,
+        &session.LastActivityAt,
+        &session.IsActive,
+        &session.CreatedAt,
+        &session.UpdatedAt,
+    )
+    
+    if err == sql.ErrNoRows {
+        return nil, errors.New("session not found")
+    }
+    
+    return &session, err
+}
+
+func (r *sessionRepository) UpdateLastActivity(ctx context.Context, sessionID string) error {
+    _, err := r.db.ExecContext(ctx, `
+        UPDATE user_sessions 
+        SET last_activity_at = NOW() 
+        WHERE session_id = $1
+    `, sessionID)
+    
+    return err
 }
 ```
 
 ```go
 // internal/handler/auth_handler.go
 
-func (h *AuthHandler) RefreshToken(c *gin.Context) {
-    var req request.RefreshRequest
+func (h *AuthHandler) ValidateSession(c *gin.Context) {
+    var req request.ValidateSessionRequest
     if err := c.ShouldBindJSON(&req); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
         return
     }
 
-    resp, err := h.authService.RefreshAccessToken(c.Request.Context(), &req)
+    resp, err := h.authService.ValidateSession(c.Request.Context(), req.SessionID)
     if err != nil {
-        handleError(c, err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+        return
+    }
+
+    if !resp.Valid {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
         return
     }
 
@@ -518,40 +297,76 @@ func (h *AuthHandler) RefreshToken(c *gin.Context) {
 }
 ```
 
-### 2.9 Add Logout Endpoint
+### 1.5 Add Logout Endpoint
 
 ```go
 // internal/models/request/logout_request.go
 package request
 
 type LogoutRequest struct {
-    RefreshToken string `json:"refresh_token" validate:"required"`
+    SessionID string `json:"session_id" validate:"required"`
 }
 ```
 
 ```go
 // internal/service/auth_service.go
 
-func (s *authService) Logout(ctx context.Context, request *request.LogoutRequest) error {
-    err := s.refreshTokenRepo.Revoke(ctx, request.RefreshToken)
+func (s *authService) Logout(ctx context.Context, sessionID string) error {
+    // Invalidate in database
+    err := s.sessionRepo.Invalidate(ctx, sessionID)
     if err != nil {
-        logger.Error("failed to revoke refresh token", "error", err)
+        logger.Error("failed to invalidate session", "error", err)
         return apperrors.InternalServer(constants.ErrInternalServer)
     }
 
-    logger.Info("✓ User logged out successfully")
+    // Remove from cache
+    s.sessionRepo.DeleteSessionCache(ctx, sessionID)
+
+    logger.Info("✓ Session logged out", "sessionId", sessionID)
     return nil
 }
 
 func (s *authService) LogoutAllDevices(ctx context.Context, userID string) error {
-    err := s.refreshTokenRepo.RevokeAllForUser(ctx, userID)
+    // Invalidate all sessions for this user
+    err := s.sessionRepo.InvalidateAllForUser(ctx, userID)
     if err != nil {
-        logger.Error("failed to revoke all tokens", "error", err)
+        logger.Error("failed to invalidate all sessions", "error", err)
         return apperrors.InternalServer(constants.ErrInternalServer)
     }
 
-    logger.Info("✓ All devices logged out", "userId", userID)
+    // Clear cache (use pattern matching or prefix scan)
+    // This is optional - cache will expire naturally
+    
+    logger.Info("✓ All sessions logged out", "userId", userID)
     return nil
+}
+```
+
+```go
+// internal/repository/session_repository.go
+
+func (r *sessionRepository) Invalidate(ctx context.Context, sessionID string) error {
+    _, err := r.db.ExecContext(ctx, `
+        UPDATE user_sessions 
+        SET is_active = false, updated_at = NOW()
+        WHERE session_id = $1
+    `, sessionID)
+    
+    return err
+}
+
+func (r *sessionRepository) InvalidateAllForUser(ctx context.Context, userID string) error {
+    _, err := r.db.ExecContext(ctx, `
+        UPDATE user_sessions 
+        SET is_active = false, updated_at = NOW()
+        WHERE user_id = $1 AND is_active = true
+    `, userID)
+    
+    return err
+}
+
+func (r *sessionRepository) DeleteSessionCache(ctx context.Context, sessionID string) error {
+    return r.redis.Del(ctx, "session:"+sessionID).Err()
 }
 ```
 
@@ -565,7 +380,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
         return
     }
 
-    err := h.authService.Logout(c.Request.Context(), &req)
+    err := h.authService.Logout(c.Request.Context(), req.SessionID)
     if err != nil {
         handleError(c, err)
         return
@@ -575,8 +390,12 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 }
 
 func (h *AuthHandler) LogoutAllDevices(c *gin.Context) {
-    // Extract userID from validated JWT (from middleware)
+    // Extract userID from validated session (from middleware)
     userID := c.GetString("user_id")
+    if userID == "" {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+        return
+    }
 
     err := h.authService.LogoutAllDevices(c.Request.Context(), userID)
     if err != nil {
@@ -588,36 +407,7 @@ func (h *AuthHandler) LogoutAllDevices(c *gin.Context) {
 }
 ```
 
-### 2.10 Public Key Endpoint
-
-```go
-// internal/handler/auth_handler.go
-
-func (h *AuthHandler) GetPublicKey(c *gin.Context) {
-    privateKey := auth.GetPrivateKey()
-    if privateKey == nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "public key not available"})
-        return
-    }
-
-    publicKey := &privateKey.PublicKey
-    publicKeyBytes, err := x509.MarshalPKIXPublicKey(publicKey)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal public key"})
-        return
-    }
-
-    publicKeyPEM := pem.EncodeToMemory(&pem.Block{
-        Type:  "PUBLIC KEY",
-        Bytes: publicKeyBytes,
-    })
-
-    c.Header("Content-Type", "application/x-pem-file")
-    c.Data(http.StatusOK, "application/x-pem-file", publicKeyPEM)
-}
-```
-
-### 2.11 Register Routes
+### 1.6 Register Routes
 
 ```go
 // internal/routes/routes.go
@@ -627,188 +417,245 @@ func SetupRoutes(router *gin.Engine, authHandler *handler.AuthHandler) {
     {
         auth := api.Group("/auth")
         {
-            // Existing routes
+            // Public routes
             auth.POST("/register-device", authHandler.RegisterDevice)
             auth.POST("/login", authHandler.LoginWithPassword)
-            
-            // New JWT routes
-            auth.POST("/refresh", authHandler.RefreshToken)
             auth.POST("/logout", authHandler.Logout)
-            auth.GET("/public-key", authHandler.GetPublicKey)
             
-            // Protected route (requires JWT)
-            auth.POST("/logout-all", middleware.JWTAuthMiddleware(), authHandler.LogoutAllDevices)
+            // Internal route for chat-service
+            auth.POST("/validate-session", authHandler.ValidateSession)
+            
+            // Protected routes (require session validation)
+            // auth.POST("/logout-all", middleware.SessionAuthMiddleware(), authHandler.LogoutAllDevices)
         }
     }
 }
 ```
 
 **Action items:**
-- [ ] Add RefreshTokenRepository to service dependencies
-- [ ] Update AuthService constructor
 - [ ] Run database migration
-- [ ] Test login flow returns JWT tokens
-- [ ] Test refresh token flow
-- [ ] Test logout revocation
+- [ ] Update session configuration
+- [ ] Implement validation endpoint
+- [ ] Implement logout endpoints
+- [ ] Test login flow returns session ID
+- [ ] Test session validation endpoint
 
 ---
 
-## Phase 3: Chat-Service - JWT Verification
+## Phase 2: Chat-Service - Session Validation
 
-### 3.1 Load RSA Public Key at Startup
+### 2.1 Setup Configuration
 
 ```go
-// chat-service/internal/auth/keys.go
+// chat-service/internal/config/config.go
+package config
+
+import (
+    "os"
+    "time"
+)
+
+type Config struct {
+    Server      ServerConfig
+    Redis       RedisConfig
+    UserService UserServiceConfig
+}
+
+type ServerConfig struct {
+    Port string
+}
+
+type RedisConfig struct {
+    URL      string // Shared with user-service
+    CacheTTL time.Duration
+}
+
+type UserServiceConfig struct {
+    URL string // For validation API calls (fallback)
+}
+
+func Load() *Config {
+    return &Config {
+        Server: ServerConfig{
+            Port: getEnv("PORT", "8081"),
+        },
+        Redis: RedisConfig{
+            URL:      getEnv("REDIS_URL", "redis://localhost:6379"),
+            CacheTTL: 1 * time.Hour,
+        },
+        UserService: UserServiceConfig{
+            URL: getEnv("USER_SERVICE_URL", "http://localhost:8080"),
+        },
+    }
+}
+
+func getEnv(key, defaultValue string) string {
+    if value := os.Getenv(key); value != "" {
+        return value
+    }
+    return defaultValue
+}
+```
+
+### 2.2 Session Data Model
+
+```go
+// chat-service/internal/models/session.go
+package models
+
+type SessionData struct {
+    UserID   string `json:"user_id"`
+    DeviceID string `json:"device_id"`
+}
+```
+
+### 2.3 Session Validator (with Redis + user-service fallback)
+
+```go
+// chat-service/internal/auth/session_validator.go
 package auth
 
 import (
-    "crypto/rsa"
-    "crypto/x509"
-    "encoding/pem"
+    "bytes"
+    "context"
+    "encoding/json"
     "fmt"
-    "io"
     "net/http"
-    "os"
+    "time"
+
+    "chat-service/internal/config"
+    "chat-service/internal/models"
+    
+    "github.com/redis/go-redis/v9"
 )
 
-var jwtPublicKey *rsa.PublicKey
-
-// Load from file (for development)
-func LoadPublicKeyFromFile(filepath string) error {
-    keyData, err := os.ReadFile(filepath)
-    if err != nil {
-        return fmt.Errorf("failed to read public key: %w", err)
-    }
-
-    return parsePublicKey(keyData)
+type SessionValidator struct {
+    redis      *redis.Client
+    config     *config.Config
+    httpClient *http.Client
 }
 
-// Load from user-service endpoint (for production)
-func LoadPublicKeyFromUserService(userServiceURL string) error {
-    resp, err := http.Get(userServiceURL + "/api/auth/public-key")
+func NewSessionValidator(redis *redis.Client, cfg *config.Config) *SessionValidator {
+    return &SessionValidator{
+        redis:  redis,
+        config: cfg,
+        httpClient: &http.Client{
+            Timeout: 2 * time.Second,
+        },
+    }
+}
+
+func (v *SessionValidator) Validate(ctx context.Context, sessionID string) (*models.SessionData, error) {
+    // Try Redis first (fast path - 1-2ms)
+    session, err := v.getFromRedis(ctx, sessionID)
+    if err == nil {
+        return session, nil
+    }
+
+    // Cache miss - call user-service validation endpoint
+    session, err = v.validateViaUserService(ctx, sessionID)
     if err != nil {
-        return fmt.Errorf("failed to fetch public key: %w", err)
+        return nil, err
+    }
+
+    // Optional: cache in Redis (user-service should already be caching,
+    // but this keeps chat-service resilient if that ever changes)
+    v.cacheSession(ctx, sessionID, session)
+
+    return session, nil
+}
+
+func (v *SessionValidator) getFromRedis(ctx context.Context, sessionID string) (*models.SessionData, error) {
+    sessionJSON, err := v.redis.Get(ctx, "session:"+sessionID).Result()
+    if err != nil {
+        return nil, err
+    }
+
+    var session models.SessionData
+    if err := json.Unmarshal([]byte(sessionJSON), &session); err != nil {
+        return nil, err
+    }
+
+    return &session, nil
+}
+
+func (v *SessionValidator) validateViaUserService(ctx context.Context, sessionID string) (*models.SessionData, error) {
+    // Request/response types mirror user-service ValidateSession API
+    type validateRequest struct {
+        SessionID string `json:"session_id"`
+    }
+    type validateResponse struct {
+        Valid    bool   `json:"valid"`
+        UserID   string `json:"user_id"`
+        DeviceID string `json:"device_id"`
+    }
+
+    reqBody, err := json.Marshal(validateRequest{SessionID: sessionID})
+    if err != nil {
+        return nil, err
+    }
+
+    url := fmt.Sprintf(\"%s/api/auth/validate-session\", v.config.UserService.URL)
+
+    httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+    if err != nil {
+        return nil, err
+    }
+    httpReq.Header.Set(\"Content-Type\", \"application/json\")
+
+    resp, err := v.httpClient.Do(httpReq)
+    if err != nil {
+        return nil, err
     }
     defer resp.Body.Close()
 
-    if resp.StatusCode != 200 {
-        return fmt.Errorf("failed to fetch public key: status %d", resp.StatusCode)
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf(\"validate-session failed with status %d\", resp.StatusCode)
     }
 
-    keyData, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return fmt.Errorf("failed to read public key response: %w", err)
+    var body validateResponse
+    if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+        return nil, err
     }
 
-    return parsePublicKey(keyData)
+    if !body.Valid {
+        return nil, fmt.Errorf(\"session invalid or expired\")
+    }
+
+    return &models.SessionData{
+        UserID:   body.UserID,
+        DeviceID: body.DeviceID,
+    }, nil
 }
 
-func parsePublicKey(keyData []byte) error {
-    block, _ := pem.Decode(keyData)
-    if block == nil {
-        return fmt.Errorf("failed to decode PEM block")
-    }
-
-    pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+func (v *SessionValidator) cacheSession(ctx context.Context, sessionID string, session *models.SessionData) {
+    sessionJSON, err := json.Marshal(session)
     if err != nil {
-        return fmt.Errorf("failed to parse public key: %w", err)
+        return
     }
 
-    var ok bool
-    jwtPublicKey, ok = pub.(*rsa.PublicKey)
-    if !ok {
-        return fmt.Errorf("not an RSA public key")
-    }
-
-    return nil
-}
-
-func GetPublicKey() *rsa.PublicKey {
-    return jwtPublicKey
+    v.redis.Set(ctx, "session:"+sessionID, sessionJSON, v.config.Redis.CacheTTL)
 }
 ```
 
-```go
-// chat-service/cmd/server/main.go
-func main() {
-    // ... existing setup ...
-
-    // Load JWT public key from user-service
-    userServiceURL := os.Getenv("USER_SERVICE_URL") // e.g., http://user-service:8080
-    if userServiceURL == "" {
-        logger.Fatal("USER_SERVICE_URL environment variable not set")
-    }
-
-    if err := auth.LoadPublicKeyFromUserService(userServiceURL); err != nil {
-        logger.Fatal("Failed to load JWT public key", "error", err)
-    }
-    logger.Info("✓ JWT public key loaded from user-service")
-
-    // ... rest of server setup ...
-}
-```
-
-### 3.2 JWT Verification Function
+### 2.4 Authentication Middleware
 
 ```go
-// chat-service/internal/auth/jwt.go
-package auth
-
-import (
-    "fmt"
-    "github.com/golang-jwt/jwt/v5"
-)
-
-type JWTClaims struct {
-    UserID   string `json:"user_id"`
-    DeviceID string `json:"device_id"`
-    jwt.RegisteredClaims
-}
-
-func VerifyAccessToken(tokenString string) (*JWTClaims, error) {
-    publicKey := GetPublicKey()
-    if publicKey == nil {
-        return nil, fmt.Errorf("JWT public key not loaded")
-    }
-
-    token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-        // Verify signing method
-        if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-            return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-        }
-        return publicKey, nil
-    })
-
-    if err != nil {
-        return nil, fmt.Errorf("failed to parse token: %w", err)
-    }
-
-    claims, ok := token.Claims.(*JWTClaims)
-    if !ok || !token.Valid {
-        return nil, fmt.Errorf("invalid token claims")
-    }
-
-    return claims, nil
-}
-```
-
-### 3.3 Authentication Middleware
-
-```go
-// chat-service/internal/middleware/jwt_middleware.go
+// chat-service/internal/middleware/auth.go
 package middleware
 
 import (
     "net/http"
     "strings"
-    
+
     "chat-service/internal/auth"
+    
     "github.com/gin-gonic/gin"
 )
 
-func JWTAuthMiddleware() gin.HandlerFunc {
+func AuthMiddleware(validator *auth.SessionValidator) gin.HandlerFunc {
     return func(c *gin.Context) {
-        // Extract token from Authorization header
+        // Extract session ID from Authorization header
         authHeader := c.GetHeader("Authorization")
         if authHeader == "" {
             c.JSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
@@ -816,34 +663,104 @@ func JWTAuthMiddleware() gin.HandlerFunc {
             return
         }
 
-        // Check Bearer scheme
+        // Expect: "Bearer <session_id>"
         parts := strings.Split(authHeader, " ")
         if len(parts) != 2 || parts[0] != "Bearer" {
-            c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization header format"})
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format"})
             c.Abort()
             return
         }
 
-        tokenString := parts[1]
+        sessionID := parts[1]
 
-        // Verify JWT
-        claims, err := auth.VerifyAccessToken(tokenString)
+        // Validate session
+        session, err := validator.Validate(c.Request.Context(), sessionID)
         if err != nil {
-            c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
             c.Abort()
             return
         }
 
-        // Add claims to context
-        c.Set("user_id", claims.UserID)
-        c.Set("device_id", claims.DeviceID)
+        // Add to context for handlers to use
+        c.Set("user_id", session.UserID)
+        c.Set("device_id", session.DeviceID)
 
         c.Next()
     }
 }
 ```
 
-### 3.4 Protected Chat Endpoints
+### 2.5 Setup Chat Service
+
+```go
+// chat-service/cmd/server/main.go
+package main
+
+import (
+    "log"
+
+    "chat-service/internal/auth"
+    "chat-service/internal/config"
+    "chat-service/internal/handler"
+    "chat-service/internal/middleware"
+    
+    "github.com/gin-gonic/gin"
+    "github.com/redis/go-redis/v9"
+)
+
+func main() {
+    // Load configuration
+    cfg := config.Load()
+
+    // Connect to Redis (shared with user-service)
+    redisClient := redis.NewClient(&redis.Options{
+        Addr: cfg.Redis.URL,
+    })
+
+    if err := redisClient.Ping(ctx).Err(); err != nil {
+        log.Fatal("Failed to connect to Redis:", err)
+    }
+    log.Println("✓ Connected to Redis")
+
+    // Initialize session validator (Redis + user-service fallback)
+    sessionValidator := auth.NewSessionValidator(redisClient, cfg)
+
+    // Initialize handlers
+    messageHandler := handler.NewMessageHandler(/* your dependencies */)
+
+    // Setup router
+    router := gin.Default()
+
+    // Health check
+    router.GET("/health", func(c *gin.Context) {
+        c.JSON(200, gin.H{"status": "ok"})
+    })
+
+    // API routes with authentication
+    api := router.Group("/api")
+    {
+        messages := api.Group("/messages")
+        messages.Use(middleware.AuthMiddleware(sessionValidator))
+        {
+            messages.POST("/send", messageHandler.SendMessage)
+            messages.GET("/:room_id", messageHandler.GetMessages)
+        }
+
+        rooms := api.Group("/rooms")
+        rooms.Use(middleware.AuthMiddleware(sessionValidator))
+        {
+            rooms.POST("/create", messageHandler.CreateRoom)
+            rooms.POST("/join", messageHandler.JoinRoom)
+            rooms.POST("/leave", messageHandler.LeaveRoom)
+        }
+    }
+
+    log.Printf("🚀 Chat service running on :%s", cfg.Server.Port)
+    router.Run(":" + cfg.Server.Port)
+}
+```
+
+### 2.6 Protected Handlers Example
 
 ```go
 // chat-service/internal/handler/message_handler.go
@@ -851,21 +768,26 @@ package handler
 
 import (
     "net/http"
+
     "github.com/gin-gonic/gin"
 )
 
 type MessageHandler struct {
-    // ... your dependencies
+    // your dependencies
+}
+
+func NewMessageHandler(/* deps */) *MessageHandler {
+    return &MessageHandler{}
 }
 
 func (h *MessageHandler) SendMessage(c *gin.Context) {
-    // Extract user info from context (set by middleware)
+    // Extract user info from context (set by auth middleware)
     userID := c.GetString("user_id")
     deviceID := c.GetString("device_id")
 
     var req struct {
-        RoomID  string `json:"room_id" validate:"required"`
-        Message string `json:"message" validate:"required"`
+        RoomID  string `json:"room_id" binding:"required"`
+        Message string `json:"message" binding:"required"`
     }
 
     if err := c.ShouldBindJSON(&req); err != nil {
@@ -874,13 +796,12 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
     }
 
     // Process message...
-    // logger.Info("User sent message", "userId", userID, "deviceId", deviceID, "roomId", req.RoomID)
-
     // Store in database, broadcast to room, etc.
-
+    
     c.JSON(http.StatusOK, gin.H{
-        "status": "message sent",
+        "status":  "message sent",
         "user_id": userID,
+        "room_id": req.RoomID,
     })
 }
 
@@ -892,578 +813,632 @@ func (h *MessageHandler) GetMessages(c *gin.Context) {
     // Verify user has access to this room...
 
     c.JSON(http.StatusOK, gin.H{
-        "room_id": roomID,
-        "user_id": userID,
-        "messages": []string{}, // Your actual messages
+        "room_id":  roomID,
+        "user_id":  userID,
+        "messages": []interface{}{}, // Your actual messages
     })
 }
-```
 
-### 3.5 Register Protected Routes
+func (h *MessageHandler) CreateRoom(c *gin.Context) {
+    userID := c.GetString("user_id")
 
-```go
-// chat-service/internal/routes/routes.go
-
-func SetupRoutes(router *gin.Engine, messageHandler *handler.MessageHandler) {
-    api := router.Group("/api")
-    {
-        // All message routes require JWT authentication
-        messages := api.Group("/messages")
-        messages.Use(middleware.JWTAuthMiddleware())
-        {
-            messages.POST("/send", messageHandler.SendMessage)
-            messages.GET("/:room_id", messageHandler.GetMessages)
-        }
-
-        rooms := api.Group("/rooms")
-        rooms.Use(middleware.JWTAuthMiddleware())
-        {
-            rooms.POST("/create", messageHandler.CreateRoom)
-            rooms.POST("/join", messageHandler.JoinRoom)
-            rooms.POST("/leave", messageHandler.LeaveRoom)
-        }
+    var req struct {
+        Name string `json:"name" binding:"required"`
     }
+
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+        return
+    }
+
+    // Create room logic...
+
+    c.JSON(http.StatusOK, gin.H{
+        "status":  "room created",
+        "creator": userID,
+    })
+}
+
+func (h *MessageHandler) JoinRoom(c *gin.Context) {
+    userID := c.GetString("user_id")
+    // Join room logic...
+    c.JSON(http.StatusOK, gin.H{"status": "joined", "user_id": userID})
+}
+
+func (h *MessageHandler) LeaveRoom(c *gin.Context) {
+    userID := c.GetString("user_id")
+    // Leave room logic...
+    c.JSON(http.StatusOK, gin.H{"status": "left", "user_id": userID})
 }
 ```
 
 **Action items:**
-- [ ] Set USER_SERVICE_URL environment variable
-- [ ] Implement JWT verification
-- [ ] Add auth middleware to all protected routes
-- [ ] Test authenticated requests
-- [ ] Test expired/invalid token rejection
+- [ ] Set environment variables (DATABASE_URL, REDIS_URL)
+- [ ] Implement session validator
+- [ ] Add auth middleware
+- [ ] Protect all chat endpoints
+- [ ] Test with valid session ID
+- [ ] Test with invalid/expired session ID
 
 ---
 
-## Phase 4: Client Implementation
+## Phase 3: Mobile/Desktop Client Implementation
 
-### 4.1 Token Storage
+### 3.1 Secure Storage Setup
 
 ```javascript
-// client/src/auth/tokenManager.js
+// React Native
+import * as SecureStore from 'expo-secure-store';
 
-class TokenManager {
-    constructor() {
-        this.accessToken = localStorage.getItem('access_token');
-        this.refreshToken = localStorage.getItem('refresh_token');
-        this.expiresAt = parseInt(localStorage.getItem('token_expires_at') || '0');
-        
-        // Check and refresh on initialization
-        this.checkAndRefresh();
-        
-        // Check every 30 minutes
-        setInterval(() => this.checkAndRefresh(), 30 * 60 * 1000);
-    }
+// Electron
+import keytar from 'keytar';
 
-    saveTokens(accessToken, refreshToken, expiresIn) {
-        this.accessToken = accessToken;
-        this.refreshToken = refreshToken;
-        this.expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
-
-        localStorage.setItem('access_token', accessToken);
-        localStorage.setItem('refresh_token', refreshToken);
-        localStorage.setItem('token_expires_at', this.expiresAt.toString());
-    }
-
-    async checkAndRefresh() {
-        const now = Math.floor(Date.now() / 1000);
-        const timeUntilExpiry = this.expiresAt - now;
-
-        // Refresh if less than 30 minutes until expiry
-        if (timeUntilExpiry < 30 * 60 && this.refreshToken) {
-            console.log('Token expiring soon, refreshing...');
-            await this.refreshAccessToken();
+const SecureStorage = {
+    // React Native implementation
+    async setItem(key, value) {
+        if (Platform.OS === 'web') {
+            // Desktop Electron
+            await keytar.setPassword('myapp', key, value);
+        } else {
+            // Mobile
+            await SecureStore.setItemAsync(key, value);
+        }
+    },
+    
+    async getItem(key) {
+        if (Platform.OS === 'web') {
+            return await keytar.getPassword('myapp', key);
+        } else {
+            return await SecureStore.getItemAsync(key);
+        }
+    },
+    
+    async removeItem(key) {
+        if (Platform.OS === 'web') {
+            await keytar.deletePassword('myapp', key);
+        } else {
+            await SecureStore.deleteItemAsync(key);
         }
     }
+};
 
-    async refreshAccessToken() {
-        if (!this.refreshToken) {
-            console.error('No refresh token available');
-            return false;
-        }
-
-        try {
-            const response = await fetch('http://localhost:8080/api/auth/refresh', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ refresh_token: this.refreshToken })
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                // Keep the same refresh token, only update access token
-                this.saveTokens(data.access_token, this.refreshToken, data.expires_in);
-                console.log('✓ Token refreshed successfully');
-                return true;
-            } else {
-                console.error('Token refresh failed:', response.status);
-                this.clearTokens();
-                // Redirect to login
-                window.location.href = '/login';
-                return false;
-            }
-        } catch (error) {
-            console.error('Token refresh error:', error);
-            return false;
-        }
-    }
-
-    getAccessToken() {
-        return this.accessToken;
-    }
-
-    clearTokens() {
-        this.accessToken = null;
-        this.refreshToken = null;
-        this.expiresAt = 0;
-        localStorage.removeItem('access_token');
-        localStorage.removeItem('refresh_token');
-        localStorage.removeItem('token_expires_at');
-    }
-
-    async logout() {
-        try {
-            await fetch('http://localhost:8080/api/auth/logout', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ refresh_token: this.refreshToken })
-            });
-        } catch (error) {
-            console.error('Logout error:', error);
-        } finally {
-            this.clearTokens();
-            window.location.href = '/login';
-        }
-    }
-}
-
-export const tokenManager = new TokenManager();
+export default SecureStorage;
 ```
 
-### 4.2 API Client with Auto-Retry
+### 3.2 Authentication Service
 
 ```javascript
-// client/src/api/client.js
+// src/services/auth.js
+import SecureStorage from './secureStorage';
+import { generateHMAC, generateNonce } from './crypto';
 
-import { tokenManager } from '../auth/tokenManager';
+const USER_SERVICE_URL = 'https://your-domain.com/api/auth';
 
-class APIClient {
-    constructor(baseURL) {
-        this.baseURL = baseURL;
-    }
-
-    async request(endpoint, options = {}) {
-        const token = tokenManager.getAccessToken();
+export const AuthService = {
+    async login(username, password, deviceID, serverHMACKey) {
+        const timestamp = Date.now().toString();
+        const nonce = generateNonce();
         
+        // Generate session ID (HMAC-based)
+        const sessionData = `${deviceID}:${timestamp}:${nonce}`;
+        const sessionID = generateHMAC(serverHMACKey, sessionData);
+        
+        // Generate device signature
+        const loginMessage = `login:${username}:${timestamp}:${nonce}`;
+        const deviceSignature = generateHMAC(serverHMACKey, loginMessage);
+
+        const response = await fetch(`${USER_SERVICE_URL}/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                username,
+                password,
+                device_id: deviceID,
+                timestamp,
+                nonce,
+                session_id: sessionID,
+                device_signature: deviceSignature,
+                device_info: getDeviceInfo(),
+                ip_address: '', // Server will set this
+            }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Login failed');
+        }
+
+        const data = await response.json();
+        
+        // Store session ID securely
+        await SecureStorage.setItem('session_id', data.session_id);
+        await SecureStorage.setItem('user_id', data.user.user_id);
+        
+        return data;
+    },
+
+    async logout() {
+        const sessionID = await SecureStorage.getItem('session_id');
+        
+        if (sessionID) {
+            try {
+                await fetch(`${USER_SERVICE_URL}/logout`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionID }),
+                });
+            } catch (error) {
+                console.error('Logout request failed:', error);
+            }
+        }
+        
+        // Clear local storage
+        await SecureStorage.removeItem('session_id');
+        await SecureStorage.removeItem('user_id');
+    },
+
+    async getSessionID() {
+        return await SecureStorage.getItem('session_id');
+    },
+
+    async isLoggedIn() {
+        const sessionID = await this.getSessionID();
+        return !!sessionID;
+    }
+};
+
+function getDeviceInfo() {
+    // Return device info string
+    return `${Platform.OS} ${Platform.Version}`;
+}
+```
+
+### 3.3 Chat API Service
+
+```javascript
+// src/services/chat.js
+import SecureStorage from './secureStorage';
+import { AuthService } from './auth';
+
+const CHAT_SERVICE_URL = 'https://your-domain.com/api';
+
+class ChatAPI {
+    async request(endpoint, options = {}) {
+        const sessionID = await SecureStorage.getItem('session_id');
+        
+        if (!sessionID) {
+            throw new Error('Not authenticated');
+        }
+
         const headers = {
             'Content-Type': 'application/json',
+            'Authorization': `Bearer ${sessionID}`,
             ...options.headers,
         };
 
-        if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-        }
-
-        const url = `${this.baseURL}${endpoint}`;
-        let response = await fetch(url, {
+        const response = await fetch(`${CHAT_SERVICE_URL}${endpoint}`, {
             ...options,
             headers,
         });
 
-        // If 401, try refreshing token once
+        // Handle 401 - session expired
         if (response.status === 401) {
-            console.log('Got 401, attempting token refresh...');
-            const refreshed = await tokenManager.refreshAccessToken();
-            
-            if (refreshed) {
-                // Retry with new token
-                headers['Authorization'] = `Bearer ${tokenManager.getAccessToken()}`;
-                response = await fetch(url, {
-                    ...options,
-                    headers,
-                });
-            } else {
-                // Refresh failed, redirect to login
-                window.location.href = '/login';
-                throw new Error('Authentication failed');
-            }
+            // Clear invalid session and redirect to login
+            await AuthService.logout();
+            throw new Error('Session expired. Please login again.');
         }
 
-        return response;
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Request failed');
+        }
+
+        return response.json();
     }
 
-    async get(endpoint) {
-        return this.request(endpoint, { method: 'GET' });
-    }
-
-    async post(endpoint, data) {
-        return this.request(endpoint, {
+    async sendMessage(roomID, message) {
+        return this.request('/messages/send', {
             method: 'POST',
-            body: JSON.stringify(data),
+            body: JSON.stringify({
+                room_id: roomID,
+                message: message,
+            }),
+        });
+    }
+
+    async getMessages(roomID) {
+        return this.request(`/messages/${roomID}`, {
+            method: 'GET',
+        });
+    }
+
+    async createRoom(name) {
+        return this.request('/rooms/create', {
+            method: 'POST',
+            body: JSON.stringify({ name }),
+        });
+    }
+
+    async joinRoom(roomID) {
+        return this.request('/rooms/join', {
+            method: 'POST',
+            body: JSON.stringify({ room_id: roomID }),
+        });
+    }
+
+    async leaveRoom(roomID) {
+        return this.request('/rooms/leave', {
+            method: 'POST',
+            body: JSON.stringify({ room_id: roomID }),
         });
     }
 }
 
-export const chatClient = new APIClient('http://localhost:8081/api');
-export const authClient = new APIClient('http://localhost:8080/api');
+export const chatAPI = new ChatAPI();
 ```
 
-### 4.3 Login Flow
+### 3.4 Usage Example
 
 ```javascript
-// client/src/auth/login.js
+// src/screens/LoginScreen.js
+import { AuthService } from '../services/auth';
 
-import { tokenManager } from './tokenManager';
-import { authClient } from '../api/client';
-import { generateHMAC, generateNonce } from './crypto';
+export default function LoginScreen() {
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
 
-async function login(username, password, deviceID, serverHMACKey) {
-    const timestamp = Date.now();
-    const nonce = generateNonce();
-    
-    // Generate session ID
-    const sessionData = `${deviceID}:${timestamp}:${nonce}`;
-    const sessionID = generateHMAC(serverHMACKey, sessionData);
-    
-    // Generate device signature
-    const loginMessage = `login:${username}:${timestamp}:${nonce}`;
-    const deviceSignature = generateHMAC(serverHMACKey, loginMessage);
+    const handleLogin = async () => {
+        try {
+            const deviceID = await getDeviceID(); // Your device registration logic
+            const serverHMACKey = await getServerHMACKey(); // From device registration
+            
+            const result = await AuthService.login(
+                username, 
+                password, 
+                deviceID, 
+                serverHMACKey
+            );
+            
+            console.log('Logged in:', result.user);
+            // Navigate to chat screen
+        } catch (error) {
+            alert(error.message);
+        }
+    };
 
-    const response = await fetch('http://localhost:8080/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            username,
-            password,
-            device_id: deviceID,
-            timestamp: timestamp.toString(),
-            nonce,
-            session_id: sessionID,
-            device_signature: deviceSignature,
-            device_info: navigator.userAgent,
-            ip_address: '', // Will be set by server
-        }),
-    });
-
-    if (response.ok) {
-        const data = await response.json();
-        
-        // Save JWT tokens
-        tokenManager.saveTokens(
-            data.access_token,
-            data.refresh_token,
-            data.expires_in
-        );
-
-        console.log('✓ Logged in successfully');
-        console.log('User:', data.user);
-        
-        return data;
-    } else {
-        const error = await response.json();
-        throw new Error(error.error || 'Login failed');
-    }
+    return (
+        <View>
+            <TextInput value={username} onChangeText={setUsername} />
+            <TextInput value={password} onChangeText={setPassword} secureTextEntry />
+            <Button title="Login" onPress={handleLogin} />
+        </View>
+    );
 }
-
-export { login };
 ```
 
-### 4.4 Chat API Usage
-
 ```javascript
-// client/src/chat/messages.js
+// src/screens/ChatScreen.js
+import { chatAPI } from '../services/chat';
 
-import { chatClient } from '../api/client';
+export default function ChatScreen({ roomID }) {
+    const [message, setMessage] = useState('');
+    const [messages, setMessages] = useState([]);
 
-async function sendMessage(roomID, message) {
-    try {
-        const response = await chatClient.post('/messages/send', {
-            room_id: roomID,
-            message: message,
-        });
+    useEffect(() => {
+        loadMessages();
+    }, []);
 
-        if (response.ok) {
-            const data = await response.json();
-            console.log('✓ Message sent:', data);
-            return data;
-        } else {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to send message');
+    const loadMessages = async () => {
+        try {
+            const result = await chatAPI.getMessages(roomID);
+            setMessages(result.messages);
+        } catch (error) {
+            alert(error.message);
         }
-    } catch (error) {
-        console.error('Send message error:', error);
-        throw error;
-    }
-}
+    };
 
-async function getMessages(roomID) {
-    try {
-        const response = await chatClient.get(`/messages/${roomID}`);
-
-        if (response.ok) {
-            const data = await response.json();
-            return data.messages;
-        } else {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to get messages');
+    const handleSend = async () => {
+        try {
+            await chatAPI.sendMessage(roomID, message);
+            setMessage('');
+            loadMessages(); // Refresh messages
+        } catch (error) {
+            alert(error.message);
         }
-    } catch (error) {
-        console.error('Get messages error:', error);
-        throw error;
-    }
-}
+    };
 
-export { sendMessage, getMessages };
+    return (
+        <View>
+            <FlatList data={messages} renderItem={({ item }) => (
+                <Text>{item.message}</Text>
+            )} />
+            <TextInput value={message} onChangeText={setMessage} />
+            <Button title="Send" onPress={handleSend} />
+        </View>
+    );
+}
 ```
 
 **Action items:**
-- [ ] Implement TokenManager class
-- [ ] Implement API client with auto-retry
-- [ ] Update login flow to save tokens
-- [ ] Test token refresh flow
-- [ ] Test chat API calls with JWT
+- [ ] Setup secure storage (expo-secure-store or keytar)
+- [ ] Implement AuthService
+- [ ] Implement ChatAPI
+- [ ] Test login flow
+- [ ] Test chat operations
+- [ ] Test session expiry handling
 
 ---
 
-## Phase 5: Testing & Validation
+## Phase 4: Testing & Validation
 
-### 5.1 Test Checklist
-
-**User-Service:**
-- [ ] Generate RSA keys successfully
-- [ ] Load private key at startup
-- [ ] Login returns JWT tokens
-- [ ] Refresh token endpoint works
-- [ ] Logout revokes refresh token
-- [ ] Public key endpoint returns valid PEM
-- [ ] Cannot refresh with revoked token
-- [ ] Cannot refresh with expired token
-
-**Chat-Service:**
-- [ ] Load public key at startup
-- [ ] Verify valid JWT successfully
-- [ ] Reject expired JWT
-- [ ] Reject invalid signature
-- [ ] Extract user_id and device_id from JWT
-- [ ] Protected endpoints require valid JWT
-- [ ] 401 on missing/invalid token
-
-**Client:**
-- [ ] Store tokens after login
-- [ ] Include JWT in API requests
-- [ ] Auto-refresh before expiry
-- [ ] Retry failed requests after refresh
-- [ ] Logout clears tokens
-- [ ] Redirect to login when refresh fails
-
-### 5.2 Manual Testing Scripts
+### 4.1 Manual Testing
 
 ```bash
-# 1. Login (after device registration)
-curl -X POST http://localhost:8080/api/auth/login \
+# 1. Test login
+curl -X POST https://your-domain.com/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "username": "testuser",
     "password": "testpass123",
-    "device_id": "your-device-id",
+    "device_id": "device-123",
     "timestamp": "1234567890",
     "nonce": "random-nonce",
     "session_id": "hmac-session-id",
     "device_signature": "hmac-signature",
-    "device_info": "test-device"
+    "device_info": "iOS 17"
   }'
 
-# Save access_token and refresh_token from response
+# Response: { "session_id": "...", "user": {...} }
+# Save the session_id
 
-# 2. Test chat service with JWT
-curl -X POST http://localhost:8081/api/messages/send \
-  -H "Authorization: Bearer <access_token>" \
+# 2. Test chat with valid session
+curl -X POST https://your-domain.com/api/messages/send \
+  -H "Authorization: Bearer <session_id>" \
   -H "Content-Type: application/json" \
-  -d '{"room_id":"test-room","message":"Hello World"}'
+  -d '{"room_id":"room-1","message":"Hello World"}'
 
-# 3. Test token refresh
-curl -X POST http://localhost:8080/api/auth/refresh \
-  -H "Content-Type: application/json" \
-  -d '{"refresh_token":"<refresh_token>"}'
+# Response: { "status": "message sent", "user_id": "..." }
+
+# 3. Test Redis cache (first request hits DB, second hits cache)
+# Run the same request twice and check logs
 
 # 4. Test logout
-curl -X POST http://localhost:8080/api/auth/logout \
+curl -X POST https://your-domain.com/api/auth/logout \
   -H "Content-Type: application/json" \
-  -d '{"refresh_token":"<refresh_token>"}'
+  -d '{"session_id":"<session_id>"}'
 
-# 5. Verify JWT is now invalid (should get 401)
-curl -X POST http://localhost:8081/api/messages/send \
-  -H "Authorization: Bearer <old_access_token>" \
+# 5. Test session is now invalid
+curl -X POST https://your-domain.com/api/messages/send \
+  -H "Authorization: Bearer <old_session_id>" \
   -H "Content-Type: application/json" \
-  -d '{"room_id":"test-room","message":"Should fail"}'
+  -d '{"room_id":"room-1","message":"Should fail"}'
+
+# Response: 401 Unauthorized
 ```
 
-### 5.3 Integration Test
+### 4.2 Test Checklist
 
-```go
-// user-service/tests/integration/jwt_test.go
-package integration
+**User-Service:**
+- [ ] Login creates session in database
+- [ ] Login caches session in Redis
+- [ ] Session has 1 year expiry
+- [ ] Validation endpoint works
+- [ ] Logout invalidates session
+- [ ] Cannot use session after logout
 
-import (
-    "testing"
-    "time"
-)
+**Chat-Service:**
+- [ ] Rejects requests without Authorization header
+- [ ] Rejects requests with invalid session
+- [ ] Accepts requests with valid session
+- [ ] First request checks DB (cache miss)
+- [ ] Second request uses Redis (cache hit)
+- [ ] Extracts user_id and device_id correctly
 
-func TestJWTFlow(t *testing.T) {
-    // 1. Login and get tokens
-    loginResp := loginUser(t, "testuser", "testpass")
-    accessToken := loginResp.AccessToken
-    refreshToken := loginResp.RefreshToken
+**Client:**
+- [ ] Stores session ID in secure storage
+- [ ] Includes session ID in all chat requests
+- [ ] Handles 401 by logging out
+- [ ] Login persists across app restarts
 
-    // 2. Verify access token works
-    err := sendMessage(t, accessToken, "test-room", "hello")
-    assert.NoError(t, err)
+### 4.3 Performance Testing
 
-    // 3. Wait for token to expire (in test, use short expiry)
-    time.Sleep(3 * time.Second)
+```bash
+# Test Redis performance
+redis-cli --latency
+# Should be < 1ms
 
-    // 4. Access token should be expired
-    err = sendMessage(t, accessToken, "test-room", "should fail")
-    assert.Error(t, err)
+# Test DB performance
+psql -d yourdb -c "EXPLAIN ANALYZE SELECT user_id, device_id FROM user_sessions WHERE session_id = 'test' AND is_active = true;"
 
-    // 5. Refresh token
-    newAccessToken := refreshAccessToken(t, refreshToken)
-
-    // 6. New access token should work
-    err = sendMessage(t, newAccessToken, "test-room", "should work")
-    assert.NoError(t, err)
-
-    // 7. Logout
-    logout(t, refreshToken)
-
-    // 8. Cannot refresh after logout
-    err = refreshAccessToken(t, refreshToken)
-    assert.Error(t, err)
-}
+# Load test chat-service
+# Install: npm install -g artillery
+artillery quick --count 100 --num 10 https://your-domain.com/api/messages/send \
+  -H "Authorization: Bearer <valid_session>" \
+  -p '{"room_id":"test","message":"load test"}'
 ```
 
 ---
 
-## Phase 6: Production Considerations
+## Phase 5: Production Setup
 
-### 6.1 Environment Variables
+### 5.1 Environment Variables
 
 ```bash
 # user-service/.env
-JWT_PRIVATE_KEY_PATH=keys/jwt_private_key.pem
-ACCESS_TOKEN_EXPIRY=2h
-REFRESH_TOKEN_EXPIRY=720h  # 30 days
-```
+DATABASE_URL=postgresql://user:pass@localhost:5432/chatapp
+REDIS_URL=redis://localhost:6379
+SESSION_CACHE_TTL=1h
+SESSION_DB_TTL=8760h  # 1 year
+PORT=8080
 
-```bash
 # chat-service/.env
-USER_SERVICE_URL=http://user-service:8080
-JWT_PUBLIC_KEY_FETCH_RETRY=3
-JWT_PUBLIC_KEY_FETCH_TIMEOUT=10s
+DATABASE_URL=postgresql://user:pass@localhost:5432/chatapp  # Same as user-service
+REDIS_URL=redis://localhost:6379  # Same as user-service
+USER_SERVICE_URL=http://user-service:8080  # Fallback (optional)
+PORT=8081
 ```
 
-### 6.2 Security Hardening
+### 5.2 Docker Compose (for local development)
 
-- [ ] Store private key in KMS/Vault (AWS KMS, HashiCorp Vault)
-- [ ] Use HTTPS/TLS for all communication
-- [ ] Implement rate limiting on refresh endpoint (max 10/hour per device)
-- [ ] Add request logging and monitoring
-- [ ] Implement token revocation list in Redis (if needed)
-- [ ] Set secure CORS policies
-- [ ] Add CSRF protection where needed
+```yaml
+# docker-compose.yml
+version: '3.8'
 
-### 6.3 Monitoring & Observability
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: chatapp
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  user-service:
+    build: ./user-service
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://user:pass@postgres:5432/chatapp
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+
+  chat-service:
+    build: ./chat-service
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: postgresql://user:pass@postgres:5432/chatapp
+      REDIS_URL: redis://redis:6379
+      USER_SERVICE_URL: http://user-service:8080
+    depends_on:
+      - postgres
+      - redis
+      - user-service
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+### 5.3 Security Checklist
+
+- [ ] **HTTPS everywhere** - Use Let's Encrypt or AWS Certificate Manager
+- [ ] **Rate limiting** - Prevent brute force attacks
 ```go
-// Add metrics
-func (s *authService) LoginWithPassword(ctx context.Context, request *request.LoginRequest) (*response.AuthResponse, error) {
-    metrics.LoginAttempts.Inc()
-    startTime := time.Now()
-    defer func() {
-        metrics.LoginDuration.Observe(time.Since(startTime).Seconds())
-    }()
+import "github.com/didip/tollbooth"
 
-    // ... existing code ...
-}
-
-func (s *authService) RefreshAccessToken(ctx context.Context, request *request.RefreshRequest) (*response.RefreshResponse, error) {
-    metrics.TokenRefreshes.Inc()
-    // ... existing code ...
-}
+limiter := tollbooth.NewLimiter(10, nil) // 10 requests per second
+router.Use(tollbooth_gin.LimitHandler(limiter))
 ```
+- [ ] **Database connection pooling**
+```go
+db.SetMaxOpenConns(25)
+db.SetMaxIdleConns(25)
+db.SetConnMaxLifetime(5 * time.Minute)
+```
+- [ ] **Redis connection pooling**
+```go
+redis.NewClient(&redis.Options{
+    PoolSize: 10,
+    MinIdleConns: 5,
+})
+```
+- [ ] **Logging** - Log all authentication events
+- [ ] **Monitoring** - Track session validation latency
 
-### 6.4 Cleanup Jobs
+### 5.4 Cleanup Job (Optional)
 
 ```go
 // cmd/cleanup/main.go
-// Run as a cron job to clean up expired tokens
+// Run daily via cron to clean up expired sessions
 
-func cleanupExpiredTokens() {
+func main() {
     db := connectDB()
     
     result, err := db.Exec(`
-        DELETE FROM refresh_tokens 
-        WHERE expires_at < NOW() 
-        OR (revoked = TRUE AND revoked_at < NOW() - INTERVAL '30 days')
+        DELETE FROM user_sessions 
+        WHERE is_active = false 
+        AND updated_at < NOW() - INTERVAL '30 days'
     `)
     
     if err != nil {
-        log.Printf("Failed to cleanup tokens: %v", err)
-        return
+        log.Fatal(err)
     }
     
     rows, _ := result.RowsAffected()
-    log.Printf("Cleaned up %d expired tokens", rows)
+    log.Printf("Cleaned up %d old sessions", rows)
 }
 ```
 
-### 6.5 Future Enhancements
-
-- [ ] Add `kid` (Key ID) for key rotation
-- [ ] Implement proper JWKS endpoint (JSON format)
-- [ ] Add refresh token rotation (new refresh token on each refresh)
-- [ ] Add device management UI (list/revoke devices)
-- [ ] Implement "remember this device" feature
-- [ ] Add JWT revocation list for immediate invalidation
-- [ ] Support multiple active sessions per user
-
 ---
 
-## Summary Timeline
+## Summary
 
-| Phase | Estimated Time | Priority |
-|-------|---------------|----------|
-| Phase 1: Key Generation | 30 min | HIGH |
-| Phase 2: User-Service JWT | 4-5 hours | HIGH |
-| Phase 3: Chat-Service Verification | 2-3 hours | HIGH |
-| Phase 4: Client Implementation | 2-3 hours | HIGH |
-| Phase 5: Testing | 2 hours | HIGH |
-| Phase 6: Production Hardening | Ongoing | MEDIUM |
+### Architecture
 
-**Total MVP Time: ~11-14 hours**
-
----
-
-## Quick Start Commands
-
-```bash
-# 1. Generate keys
-cd user-service
-mkdir -p keys
-go run cmd/keygen/main.go
-
-# 2. Run migrations
-# (assuming you have a migration tool setup)
-migrate -path migrations -database "postgres://..." up
-
-# 3. Start user-service
-JWT_PRIVATE_KEY_PATH=keys/jwt_private_key.pem go run cmd/server/main.go
-
-# 4. Start chat-service
-USER_SERVICE_URL=http://localhost:8080 go run cmd/server/main.go
-
-# 5. Test login
-curl -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d @test_login.json
 ```
+┌──────────────┐
+│ Mobile/      │
+│ Desktop      │
+│ Client       │
+└──────┬───────┘
+       │ Authorization: Bearer <session_id>
+       │
+       ├──────────────────────┐
+       │                      │
+       ▼                      ▼
+┌──────────────┐      ┌──────────────┐
+│ User-Service │      │ Chat-Service │
+│ (Login)      │      │ (Messages)   │
+└──────┬───────┘      └──────┬───────┘
+       │                     │
+       │  ┌──────────────────┤
+       │  │                  │
+       ▼  ▼                  ▼
+   ┌─────────┐          ┌─────────┐
+   │ Redis   │          │ Postgres│
+   │ (Cache) │          │  (DB)   │
+   └─────────┘          └─────────┘
+```
+
+### Performance
+
+- **99% of requests**: Redis cache hit (1-2ms) ✅
+- **1% of requests**: DB lookup (10-20ms) → cached ✅
+- **Sessions last**: 1 year (refreshed on activity) ✅
+- **User experience**: "Forever" login like Telegram ✅
+
+### Implementation Time
+
+| Phase | Time | Priority |
+|-------|------|----------|
+| Phase 1: User-Service Updates | 2-3 hours | HIGH |
+| Phase 2: Chat-Service Implementation | 2-3 hours | HIGH |
+| Phase 3: Client Implementation | 2-3 hours | HIGH |
+| Phase 4: Testing | 1-2 hours | HIGH |
+| Phase 5: Production Setup | 1-2 hours | MEDIUM |
+
+**Total: ~8-13 hours**
+
+### Key Benefits
+
+✅ **Simple** - No JWT complexity, no key management  
+✅ **Secure** - HTTPS + secure storage + session validation  
+✅ **Fast** - Redis caching, minimal latency  
+✅ **Scalable** - Handles millions of sessions  
+✅ **Flexible** - Can logout, revoke, track devices  
+✅ **Mobile-first** - Designed for mobile/desktop apps  
+
+Ready to implement? 🚀
