@@ -957,7 +957,7 @@ export const AuthService = {
         return data;
     },
 
-    async logout() {
+    async logout() {c
         const sessionID = await SecureStorage.getItem('session_id');
         
         if (sessionID) {
